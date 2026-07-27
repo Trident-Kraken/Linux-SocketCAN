@@ -1,0 +1,5 @@
+# 统一文本文件行尾为 LF（Linux C 项目，避免跨平台贡献引入 CRLF）
+* text=auto eol=lf
+
+# 二进制证据不做任何转换
+*.png binary

@@ -1,0 +1,81 @@
+# ================================================================
+#  ISO-TP / UDS Diagnostic Stack  (C11 + CMake + Python tests)
+# ================================================================
+
+# ---------- C / CMake build artifacts ----------
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.d
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.dylib
+
+# Executables (project binaries land in bin/)
+bin/
+lib/
+*.exe
+*.out
+*.app
+
+# ---------- Python (tester / automation scripts) ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- Debug / runtime artifacts ----------
+*.log
+logs/
+core
+core.*
+vgcore.*
+
+# Coverage / gcov / valgrind output
+*.gcda
+*.gcno
+*.gcov
+valgrind*.log
+
+# ---------- Captures ----------
+# Raw captures are regenerable; only curated PNGs in docs/ are committed
+*.pcap
+*.pcapng
+
+# ---------- Editors / IDEs ----------
+.vscode/
+.idea/
+.clangd/
+.cache/
+compile_commands.json
+*.swp
+*.swo
+*~
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+build-debug/
+
+# ---------- Local study notes ----------
+notes/
