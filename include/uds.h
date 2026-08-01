@@ -1,0 +1,131 @@
+#ifndef VUDS_UDS_H
+#define VUDS_UDS_H
+
+#include "isotp.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define UDS_SID_DIAGNOSTIC_SESSION_CONTROL 0x10u
+#define UDS_SID_READ_DATA_BY_IDENTIFIER 0x22u
+#define UDS_POSITIVE_RESPONSE_OFFSET 0x40u
+#define UDS_NEGATIVE_RESPONSE_SID 0x7Fu
+
+#define UDS_NRC_GENERAL_REJECT 0x10u
+#define UDS_NRC_SERVICE_NOT_SUPPORTED 0x11u
+#define UDS_NRC_SUBFUNCTION_NOT_SUPPORTED 0x12u
+#define UDS_NRC_INVALID_FORMAT 0x13u
+#define UDS_NRC_BUSY_REPEAT_REQUEST 0x21u
+#define UDS_NRC_REQUEST_SEQUENCE_ERROR 0x24u
+#define UDS_NRC_REQUEST_OUT_OF_RANGE 0x31u
+#define UDS_NRC_SECURITY_ACCESS_DENIED 0x33u
+#define UDS_NRC_INVALID_KEY 0x35u
+#define UDS_NRC_ATTEMPTS_EXCEEDED 0x36u
+#define UDS_NRC_DELAY_NOT_EXPIRED 0x37u
+#define UDS_NRC_SUBFUNCTION_NOT_SUPPORTED_IN_SESSION 0x7Eu
+#define UDS_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION 0x7Fu
+
+#define UDS_SESSION_MASK_DEFAULT 0x01u
+#define UDS_SESSION_MASK_EXTENDED 0x02u
+
+#define UDS_DID_COOLANT_TEMPERATURE 0x0100u
+
+typedef struct uds_ctx uds_ctx_t;
+
+typedef enum {
+    UDS_SESSION_DEFAULT,
+    UDS_SESSION_EXTENDED,
+} uds_session_t;
+
+typedef enum {
+    UDS_SECURITY_LOCKED,
+    UDS_SECURITY_SEED_SENT,
+    UDS_SECURITY_UNLOCKED,
+} uds_security_state_t;
+
+typedef struct {
+    const uint8_t *data;
+    uint16_t       len;
+    uint8_t        sid;
+    uint8_t        subfunction;
+    bool           suppress_positive;
+} uds_request_t;
+
+typedef struct {
+    uint8_t  *data;
+    uint16_t  capacity;
+    uint16_t  len;
+} uds_response_t;
+
+typedef enum {
+    UDS_RESULT_OK = 0,
+    UDS_ERROR_GENERAL_REJECT,
+    UDS_ERROR_SERVICE_NOT_SUPPORTED,
+    UDS_ERROR_SUBFUNCTION_NOT_SUPPORTED,
+    UDS_ERROR_INVALID_FORMAT,
+    UDS_ERROR_REQUEST_OUT_OF_RANGE,
+    UDS_ERROR_SEQUENCE,
+    UDS_ERROR_SECURITY_DENIED,
+    UDS_ERROR_INVALID_KEY,
+    UDS_ERROR_ATTEMPTS_EXCEEDED,
+    UDS_ERROR_DELAY_NOT_EXPIRED,
+    UDS_ERROR_SERVICE_NOT_SUPPORTED_IN_SESSION,
+} uds_result_t;
+
+typedef uds_result_t (*uds_validator_t)(const uds_request_t *request);
+typedef uds_result_t (*uds_handler_t)(uds_ctx_t *ctx,
+                                      const uds_request_t *request,
+                                      uds_response_t *response);
+
+typedef struct {
+    uint8_t         sid;
+    uint8_t         session_mask;
+    bool            need_security;
+    bool            has_subfunction;
+    bool            supports_suppress;
+    uint16_t        min_len;
+    uint16_t        max_len;
+    uds_validator_t validate;
+    uds_handler_t   handle;
+} uds_service_entry_t;
+
+typedef struct {
+    uint64_t requests;
+    uint64_t positive_responses;
+    uint64_t negative_responses;
+} uds_stats_t;
+
+struct uds_ctx {
+    isotp_ctx_t         *transport;
+    uds_session_t        session;
+    uds_security_state_t security_state;
+    int                  s3_timer_fd;
+    uint8_t              response_buffer[ISOTP_MAX_LEN];
+    uint8_t              busy_sid;
+    bool                 busy_sid_valid;
+    bool                 initialized;
+    uds_stats_t          stats;
+};
+
+int                uds_init(uds_ctx_t *ctx, isotp_ctx_t *transport);
+void               uds_deinit(uds_ctx_t *ctx);
+void               uds_on_isotp_message(const uint8_t *data, uint16_t len,
+                                         void *user);
+void               uds_on_isotp_tx_done(int status, void *user);
+int                uds_s3_timer_fd(const uds_ctx_t *ctx);
+int                uds_on_s3_timer(uds_ctx_t *ctx);
+const uds_stats_t *uds_get_stats(const uds_ctx_t *ctx);
+
+/* Internal interfaces shared by the UDS compilation units. */
+uds_result_t uds_validate_diagnostic_session_control(
+    const uds_request_t *request);
+uds_result_t uds_handle_diagnostic_session_control(
+    uds_ctx_t *ctx, const uds_request_t *request,
+    uds_response_t *response);
+uds_result_t uds_handle_read_data_by_identifier(
+    uds_ctx_t *ctx, const uds_request_t *request,
+    uds_response_t *response);
+uds_result_t uds_data_read_did(uint16_t did, uint8_t *data,
+                               uint16_t capacity, uint16_t *len);
+
+#endif
