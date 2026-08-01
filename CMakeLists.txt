@@ -31,12 +31,29 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING)
+    add_executable(isotp_rx_harness
+        tests/isotp_rx_harness.c
+        src/isotp.c
+    )
+    target_include_directories(isotp_rx_harness PRIVATE include)
+    target_compile_options(isotp_rx_harness PRIVATE -Wall -Wextra -Werror)
+    if(VUDS_ENABLE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(isotp_rx_harness PRIVATE
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+        target_link_options(isotp_rx_harness PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(
             NAME python_tests
             COMMAND ${Python3_EXECUTABLE} -m pytest tests/ -v
                     --ecu-binary=$<TARGET_FILE:vuds_ecu>
+                    --isotp-harness=$<TARGET_FILE:isotp_rx_harness>
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         )
     endif()

@@ -23,6 +23,11 @@ def pytest_addoption(parser):
         default=os.environ.get("VCAN_INTERFACE", "vcan0"),
         help="SocketCAN interface used by integration tests",
     )
+    group.addoption(
+        "--isotp-harness",
+        default=str(PROJECT_ROOT / "build" / "isotp_rx_harness"),
+        help="path to the ISO-TP RX API harness",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -36,6 +41,14 @@ def ecu_binary(pytestconfig):
     if not binary.is_file():
         pytest.skip(f"ECU binary not found: {binary}")
     return binary
+
+
+@pytest.fixture(scope="session")
+def isotp_harness(pytestconfig):
+    harness = Path(pytestconfig.getoption("--isotp-harness")).resolve()
+    if not harness.is_file():
+        pytest.skip(f"ISO-TP harness not found: {harness}")
+    return harness
 
 
 @pytest.fixture(scope="session")

@@ -8,6 +8,7 @@
 
 #define ISOTP_MAX_LEN 4095u
 #define ISOTP_SF_MAX_LEN 7u
+#define ISOTP_N_CR_MS 1000u
 #define ISOTP_PADDING_BYTE 0xAAu
 
 typedef void (*isotp_rx_cb_t)(const uint8_t *data, uint16_t len, void *user);
@@ -53,6 +54,8 @@ typedef struct {
     uint8_t          rx_buffer[ISOTP_MAX_LEN];
     uint8_t          tx_buffer[ISOTP_MAX_LEN];
     uint16_t         rx_len;
+    uint16_t         rx_total_len;
+    uint8_t          rx_expected_sn;
     uint16_t         tx_len;
     uint32_t         tx_stmin_us;
     bool             initialized;
