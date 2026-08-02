@@ -8,6 +8,7 @@
 
 #define ISOTP_MAX_LEN 4095u
 #define ISOTP_SF_MAX_LEN 7u
+#define ISOTP_N_BS_MS 1000u
 #define ISOTP_N_CR_MS 1000u
 #define ISOTP_PADDING_BYTE 0xAAu
 
@@ -56,7 +57,11 @@ typedef struct {
     uint16_t         rx_len;
     uint16_t         rx_total_len;
     uint8_t          rx_expected_sn;
-    uint16_t         tx_len;
+    uint16_t         tx_total_len;
+    uint16_t         tx_offset;
+    uint8_t          tx_next_sn;
+    uint8_t          tx_block_size;
+    uint8_t          tx_block_count;
     uint32_t         tx_stmin_us;
     bool             initialized;
     isotp_stats_t    stats;

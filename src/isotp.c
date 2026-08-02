@@ -17,8 +17,12 @@
 #define ISOTP_FF_LEN_HIGH_MASK 0x0Fu
 #define ISOTP_CF_SN_MASK 0x0Fu
 #define ISOTP_FC_CTS 0x00u
+#define ISOTP_FC_WAIT 0x01u
+#define ISOTP_FC_OVERFLOW 0x02u
+#define ISOTP_FC_FS_MASK 0x0Fu
 #define ISOTP_FC_BS 0x00u
 #define ISOTP_FC_STMIN 0x00u
+#define ISOTP_TIMER_MIN_NS 1L
 
 /*
  * RX transitions:
@@ -29,12 +33,15 @@
  * RX_WAIT_CF -- valid CF/SN error --> RX_IDLE
  * RX_WAIT_CF -- N_Cr timeout --> RX_IDLE
  *
- * TX transitions active in T003:
- * TX_IDLE -- send SF  --> TX_IDLE -- on_tx_done()
+ * TX transitions:
+ * TX_IDLE -- send SF --> TX_IDLE -- on_tx_done()
+ * TX_IDLE -- send FF --> TX_WAIT_FC -- FC CTS --> TX_WAIT_STMIN
+ * TX_WAIT_FC -- FC Wait --> TX_WAIT_FC
+ * TX_WAIT_STMIN -- timer --> TX_WAIT_STMIN or TX_WAIT_FC or TX_IDLE
+ * TX_WAIT_FC -- timeout/Overflow --> TX_IDLE
  *
- * TX_WAIT_FC/TX_WAIT_STMIN are reserved for T005. FC frames are ignored
- * until the TX state machine is implemented. Invalid frames never change
- * either state machine.
+ * RX and TX transitions are independent. FC frames only affect TX, while
+ * SF/FF/CF frames only affect RX.
  */
 
 static bool isotp_timer_valid(isotp_timer_t timer)
@@ -74,8 +81,8 @@ static int isotp_disarm_timer(isotp_ctx_t *ctx, isotp_timer_t timer)
     return isotp_drain_timer(ctx, timer);
 }
 
-static int isotp_arm_timer(isotp_ctx_t *ctx, isotp_timer_t timer,
-                           uint32_t milliseconds)
+static int isotp_arm_timer_us(isotp_ctx_t *ctx, isotp_timer_t timer,
+                              uint32_t microseconds)
 {
     struct itimerspec value = {0};
     int result;
@@ -84,8 +91,12 @@ static int isotp_arm_timer(isotp_ctx_t *ctx, isotp_timer_t timer,
     if (result < 0) {
         return result;
     }
-    value.it_value.tv_sec = (time_t)(milliseconds / 1000u);
-    value.it_value.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
+    value.it_value.tv_sec = (time_t)(microseconds / 1000000u);
+    value.it_value.tv_nsec = (long)(microseconds % 1000000u) * 1000L;
+    if (microseconds == 0u) {
+        /* A zero ISO-TP STmin still needs an epoll turn to avoid a loop. */
+        value.it_value.tv_nsec = ISOTP_TIMER_MIN_NS;
+    }
     if (timerfd_settime(ctx->timer_fds[timer], 0, &value, NULL) < 0) {
         return -errno;
     }
@@ -104,6 +115,39 @@ static void isotp_reset_rx(isotp_ctx_t *ctx)
     ctx->rx_len = 0u;
     ctx->rx_total_len = 0u;
     ctx->rx_expected_sn = 0u;
+}
+
+static int isotp_reset_tx(isotp_ctx_t *ctx)
+{
+    int first_error = 0;
+    int result;
+
+    result = isotp_stop_timer(ctx, ISOTP_TIMER_N_BS);
+    if (result < 0) {
+        first_error = result;
+    }
+    result = isotp_stop_timer(ctx, ISOTP_TIMER_STMIN);
+    if (result < 0 && first_error == 0) {
+        first_error = result;
+    }
+    ctx->tx_state = ISOTP_TX_IDLE;
+    ctx->tx_total_len = 0u;
+    ctx->tx_offset = 0u;
+    ctx->tx_next_sn = 0u;
+    ctx->tx_block_size = 0u;
+    ctx->tx_block_count = 0u;
+    ctx->tx_stmin_us = 0u;
+    return first_error;
+}
+
+static void isotp_finish_tx(isotp_ctx_t *ctx, int status)
+{
+    int reset_result = isotp_reset_tx(ctx);
+
+    if (reset_result < 0) {
+        status = reset_result;
+    }
+    ctx->config.on_tx_done(status, ctx->config.user);
 }
 
 static bool isotp_padding_valid(const can_frame_t *frame, uint8_t first_unused)
@@ -127,6 +171,138 @@ static int isotp_send_flow_control(isotp_ctx_t *ctx)
     frame.data[1] = ISOTP_FC_BS;
     frame.data[2] = ISOTP_FC_STMIN;
     return can_send(ctx->config.can, &frame);
+}
+
+static int isotp_send_first_frame(isotp_ctx_t *ctx)
+{
+    can_frame_t frame;
+
+    frame.id = ctx->config.tx_id;
+    frame.dlc = CAN_CLASSIC_DLEN;
+    (void)memset(frame.data, ISOTP_PADDING_BYTE, sizeof(frame.data));
+    frame.data[0] = (uint8_t)(ISOTP_PCI_FF |
+                              ((ctx->tx_total_len >> 8) &
+                               ISOTP_FF_LEN_HIGH_MASK));
+    frame.data[1] = (uint8_t)(ctx->tx_total_len & 0xFFu);
+    (void)memcpy(&frame.data[2], ctx->tx_buffer, 6u);
+    return can_send(ctx->config.can, &frame);
+}
+
+static int isotp_send_consecutive_frame(isotp_ctx_t *ctx,
+                                        uint8_t *payload_len)
+{
+    can_frame_t frame;
+    uint16_t remaining;
+    uint8_t length;
+    int result;
+
+    if (ctx->tx_offset >= ctx->tx_total_len) {
+        return -EINVAL;
+    }
+
+    remaining = (uint16_t)(ctx->tx_total_len - ctx->tx_offset);
+    length = remaining > 7u ? 7u : (uint8_t)remaining;
+    frame.id = ctx->config.tx_id;
+    frame.dlc = CAN_CLASSIC_DLEN;
+    (void)memset(frame.data, ISOTP_PADDING_BYTE, sizeof(frame.data));
+    frame.data[0] = (uint8_t)(ISOTP_PCI_CF | ctx->tx_next_sn);
+    (void)memcpy(&frame.data[1], &ctx->tx_buffer[ctx->tx_offset], length);
+    result = can_send(ctx->config.can, &frame);
+    if (result < 0) {
+        return result;
+    }
+    *payload_len = length;
+    return 0;
+}
+
+static uint32_t isotp_decode_stmin(uint8_t stmin)
+{
+    if (stmin <= 0x7Fu) {
+        return (uint32_t)stmin * 1000u;
+    }
+    if (stmin >= 0xF1u && stmin <= 0xF9u) {
+        return (uint32_t)(stmin - 0xF0u) * 100u;
+    }
+    return 127000u;
+}
+
+static int isotp_send_next_consecutive_frame(isotp_ctx_t *ctx)
+{
+    uint8_t payload_len;
+    int result;
+
+    result = isotp_send_consecutive_frame(ctx, &payload_len);
+    if (result < 0) {
+        isotp_finish_tx(ctx, result);
+        return result;
+    }
+
+    ctx->tx_offset = (uint16_t)(ctx->tx_offset + payload_len);
+    ctx->tx_next_sn = (uint8_t)((ctx->tx_next_sn + 1u) &
+                                ISOTP_CF_SN_MASK);
+    if (ctx->tx_offset == ctx->tx_total_len) {
+        isotp_finish_tx(ctx, 0);
+        return 0;
+    }
+
+    if (ctx->tx_block_size != 0u) {
+        ctx->tx_block_count++;
+        if (ctx->tx_block_count == ctx->tx_block_size) {
+            ctx->tx_block_count = 0u;
+            ctx->tx_state = ISOTP_TX_WAIT_FC;
+            result = isotp_arm_timer_us(ctx, ISOTP_TIMER_N_BS,
+                                        ISOTP_N_BS_MS * 1000u);
+            if (result < 0) {
+                isotp_finish_tx(ctx, result);
+                return result;
+            }
+            return 0;
+        }
+    }
+
+    ctx->tx_state = ISOTP_TX_WAIT_STMIN;
+    result = isotp_arm_timer_us(ctx, ISOTP_TIMER_STMIN,
+                                ctx->tx_stmin_us);
+    if (result < 0) {
+        isotp_finish_tx(ctx, result);
+        return result;
+    }
+    return 0;
+}
+
+static int isotp_handle_flow_control(isotp_ctx_t *ctx,
+                                     const can_frame_t *frame)
+{
+    uint8_t flow_status = frame->data[0] & ISOTP_FC_FS_MASK;
+    int result;
+
+    if (ctx->tx_state != ISOTP_TX_WAIT_FC ||
+        !isotp_padding_valid(frame, 3u) || flow_status > ISOTP_FC_OVERFLOW) {
+        return 0;
+    }
+
+    if (flow_status == ISOTP_FC_WAIT) {
+        result = isotp_arm_timer_us(ctx, ISOTP_TIMER_N_BS,
+                                    ISOTP_N_BS_MS * 1000u);
+        if (result < 0) {
+            isotp_finish_tx(ctx, result);
+        }
+        return result;
+    }
+    if (flow_status == ISOTP_FC_OVERFLOW) {
+        isotp_finish_tx(ctx, -EMSGSIZE);
+        return 0;
+    }
+
+    result = isotp_stop_timer(ctx, ISOTP_TIMER_N_BS);
+    if (result < 0) {
+        isotp_finish_tx(ctx, result);
+        return result;
+    }
+    ctx->tx_block_size = frame->data[1];
+    ctx->tx_block_count = 0u;
+    ctx->tx_stmin_us = isotp_decode_stmin(frame->data[2]);
+    return isotp_send_next_consecutive_frame(ctx);
 }
 
 static int isotp_deliver_rx_message(isotp_ctx_t *ctx)
@@ -178,7 +354,8 @@ static int isotp_handle_first_frame(isotp_ctx_t *ctx,
         isotp_reset_rx(ctx);
         return result;
     }
-    result = isotp_arm_timer(ctx, ISOTP_TIMER_N_CR, ISOTP_N_CR_MS);
+    result = isotp_arm_timer_us(ctx, ISOTP_TIMER_N_CR,
+                                ISOTP_N_CR_MS * 1000u);
     if (result < 0) {
         isotp_reset_rx(ctx);
         return result;
@@ -216,7 +393,8 @@ static int isotp_handle_consecutive_frame(isotp_ctx_t *ctx,
 
     ctx->rx_expected_sn = (uint8_t)((sequence_number + 1u) &
                                     ISOTP_CF_SN_MASK);
-    result = isotp_arm_timer(ctx, ISOTP_TIMER_N_CR, ISOTP_N_CR_MS);
+    result = isotp_arm_timer_us(ctx, ISOTP_TIMER_N_CR,
+                                ISOTP_N_CR_MS * 1000u);
     if (result < 0) {
         isotp_reset_rx(ctx);
         return result;
@@ -296,23 +474,37 @@ int isotp_send(isotp_ctx_t *ctx, const uint8_t *data, uint16_t len)
     if (ctx->tx_state != ISOTP_TX_IDLE) {
         return -EBUSY;
     }
-    if (len > ISOTP_SF_MAX_LEN) {
-        return -EMSGSIZE;
+    (void)memcpy(ctx->tx_buffer, data, len);
+    if (len <= ISOTP_SF_MAX_LEN) {
+        frame.id = ctx->config.tx_id;
+        frame.dlc = CAN_CLASSIC_DLEN;
+        (void)memset(frame.data, ISOTP_PADDING_BYTE, sizeof(frame.data));
+        frame.data[0] = (uint8_t)len;
+        (void)memcpy(&frame.data[1], ctx->tx_buffer, len);
+
+        send_result = can_send(ctx->config.can, &frame);
+        isotp_finish_tx(ctx, send_result);
+        return 0;
     }
 
-    (void)memcpy(ctx->tx_buffer, data, len);
-    ctx->tx_len = len;
+    ctx->tx_total_len = len;
+    ctx->tx_offset = 6u;
+    ctx->tx_next_sn = 1u;
+    ctx->tx_block_size = 0u;
+    ctx->tx_block_count = 0u;
+    ctx->tx_stmin_us = 0u;
+    ctx->tx_state = ISOTP_TX_WAIT_FC;
 
-    frame.id = ctx->config.tx_id;
-    frame.dlc = CAN_CLASSIC_DLEN;
-    (void)memset(frame.data, ISOTP_PADDING_BYTE, sizeof(frame.data));
-    frame.data[0] = (uint8_t)len;
-    (void)memcpy(&frame.data[1], ctx->tx_buffer, len);
-
-    send_result = can_send(ctx->config.can, &frame);
-    ctx->tx_len = 0u;
-    ctx->tx_state = ISOTP_TX_IDLE;
-    ctx->config.on_tx_done(send_result, ctx->config.user);
+    send_result = isotp_send_first_frame(ctx);
+    if (send_result < 0) {
+        isotp_finish_tx(ctx, send_result);
+        return 0;
+    }
+    send_result = isotp_arm_timer_us(ctx, ISOTP_TIMER_N_BS,
+                                     ISOTP_N_BS_MS * 1000u);
+    if (send_result < 0) {
+        isotp_finish_tx(ctx, send_result);
+    }
     return 0;
 }
 
@@ -345,6 +537,7 @@ int isotp_on_frame(isotp_ctx_t *ctx, const can_frame_t *frame)
     case ISOTP_PCI_CF:
         return isotp_handle_consecutive_frame(ctx, frame);
     case ISOTP_PCI_FC:
+        return isotp_handle_flow_control(ctx, frame);
     default:
         return 0;
     }
@@ -385,6 +578,13 @@ int isotp_on_timer(isotp_ctx_t *ctx, isotp_timer_t timer)
     if (timer == ISOTP_TIMER_N_CR && ctx->rx_state == ISOTP_RX_WAIT_CF) {
         ctx->stats.timeouts++;
         isotp_reset_rx(ctx);
+    } else if (timer == ISOTP_TIMER_N_BS &&
+               ctx->tx_state == ISOTP_TX_WAIT_FC) {
+        ctx->stats.timeouts++;
+        isotp_finish_tx(ctx, -ETIMEDOUT);
+    } else if (timer == ISOTP_TIMER_STMIN &&
+               ctx->tx_state == ISOTP_TX_WAIT_STMIN) {
+        return isotp_send_next_consecutive_frame(ctx);
     }
 
     return 0;

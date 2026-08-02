@@ -74,6 +74,44 @@ def test_receive_requires_full_classic_frame_and_padding(isotp_harness):
     run_harness(isotp_harness, "strict")
 
 
+def test_transmit_single_and_multi_frame_boundaries(isotp_harness):
+    run_harness(isotp_harness, "tx-basic")
+
+
+def test_transmit_4095_byte_payload_and_wrap_sequence_number(isotp_harness):
+    run_harness(isotp_harness, "tx-boundary")
+
+
+def test_transmit_flow_control_wait_block_size_and_stmin(isotp_harness):
+    run_harness(isotp_harness, "tx-flow")
+
+
+def test_transmit_stmin_microsecond_and_reserved_values(isotp_harness):
+    run_harness(isotp_harness, "tx-stmin")
+
+
+def test_transmit_flow_control_overflow_and_n_bs_timeout(isotp_harness):
+    run_harness(isotp_harness, "tx-abort")
+
+
+def test_transmit_can_errors_complete_with_failure_status(isotp_harness):
+    run_harness(isotp_harness, "tx-can-error")
+
+
+def test_transmit_timer_cleanup_errors_complete_with_failure_status(
+    isotp_harness,
+):
+    run_harness(isotp_harness, "tx-cleanup-error")
+
+
+def test_flow_control_wait_restarts_n_bs_timer(isotp_harness):
+    run_harness(isotp_harness, "tx-wait")
+
+
+def test_uds_busy_slot_replies_after_tx_completion_or_timeout(isotp_harness):
+    run_harness(isotp_harness, "uds-busy")
+
+
 def test_seven_byte_single_frame_reaches_uds(ecu_process, vcan_interface):
     with UdsClient(vcan_interface) as client:
         response = client.request(bytes.fromhex("10 03 00 00 00 00 00"))

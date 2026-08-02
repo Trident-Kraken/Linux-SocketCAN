@@ -26,7 +26,7 @@ def pytest_addoption(parser):
     group.addoption(
         "--isotp-harness",
         default=str(PROJECT_ROOT / "build" / "isotp_rx_harness"),
-        help="path to the ISO-TP RX API harness",
+        help="path to the ISO-TP API harness",
     )
 
 

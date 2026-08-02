@@ -34,6 +34,9 @@ if(BUILD_TESTING)
     add_executable(isotp_rx_harness
         tests/isotp_rx_harness.c
         src/isotp.c
+        src/uds_engine.c
+        src/uds_services.c
+        src/uds_data.c
     )
     target_include_directories(isotp_rx_harness PRIVATE include)
     target_compile_options(isotp_rx_harness PRIVATE -Wall -Wextra -Werror)
