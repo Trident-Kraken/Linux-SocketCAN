@@ -6,10 +6,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define UDS_SID_DIAGNOSTIC_SESSION_CONTROL 0x10u
-#define UDS_SID_READ_DATA_BY_IDENTIFIER 0x22u
-#define UDS_POSITIVE_RESPONSE_OFFSET 0x40u
-#define UDS_NEGATIVE_RESPONSE_SID 0x7Fu
+#define UDS_SID_DIAGNOSTIC_SESSION_CONTROL 0x10u /* ISO 14229-1: 0x10 */
+#define UDS_SID_READ_DTC_INFORMATION 0x19u       /* ISO 14229-1: 0x19 */
+#define UDS_SID_TESTER_PRESENT 0x3Eu              /* ISO 14229-1: 0x3E */
+#define UDS_SID_READ_DATA_BY_IDENTIFIER 0x22u    /* ISO 14229-1: 0x22 */
+#define UDS_SID_WRITE_DATA_BY_IDENTIFIER 0x2Eu   /* ISO 14229-1: 0x2E */
+#define UDS_SID_SECURITY_ACCESS 0x27u             /* ISO 14229-1: 0x27 */
+#define UDS_POSITIVE_RESPONSE_OFFSET 0x40u       /* ISO 14229-1: positive SID */
+#define UDS_NEGATIVE_RESPONSE_SID 0x7Fu          /* ISO 14229-1: negative SID */
+#define UDS_S3_TIMEOUT_MS 5000u                   /* Project S3 requirement */
+#define UDS_SECURITY_LOCKOUT_MS 10000u            /* Project anti-brute-force delay */
+#define UDS_SECURITY_MAX_ATTEMPTS 3u              /* Project SecurityAccess limit */
 
 #define UDS_NRC_GENERAL_REJECT 0x10u
 #define UDS_NRC_SERVICE_NOT_SUPPORTED 0x11u
@@ -29,6 +36,13 @@
 #define UDS_SESSION_MASK_EXTENDED 0x02u
 
 #define UDS_DID_COOLANT_TEMPERATURE 0x0100u
+#define UDS_DID_ENGINE_SPEED 0x0101u
+#define UDS_DID_SAMPLE_PERIOD 0x0200u
+#define UDS_DID_ECU_SOFTWARE_VERSION 0xF189u
+#define UDS_DID_VIN 0xF190u
+
+#define UDS_DTC_REPORT_BY_STATUS_MASK 0x02u
+#define UDS_DTC_STATUS_AVAILABILITY_MASK 0x09u
 
 typedef struct uds_ctx uds_ctx_t;
 
@@ -99,6 +113,10 @@ struct uds_ctx {
     isotp_ctx_t         *transport;
     uds_session_t        session;
     uds_security_state_t security_state;
+    uint32_t             security_seed;
+    uint64_t             security_lock_until_ns;
+    uint8_t              security_failed_attempts;
+    bool                 security_seed_valid;
     int                  s3_timer_fd;
     uint8_t              response_buffer[ISOTP_MAX_LEN];
     uint8_t              busy_sid;
@@ -122,10 +140,38 @@ uds_result_t uds_validate_diagnostic_session_control(
 uds_result_t uds_handle_diagnostic_session_control(
     uds_ctx_t *ctx, const uds_request_t *request,
     uds_response_t *response);
+uds_result_t uds_validate_tester_present(const uds_request_t *request);
+uds_result_t uds_handle_tester_present(
+    uds_ctx_t *ctx, const uds_request_t *request,
+    uds_response_t *response);
+uds_result_t uds_validate_security_access(const uds_request_t *request);
+uds_result_t uds_handle_security_access(
+    uds_ctx_t *ctx, const uds_request_t *request,
+    uds_response_t *response);
+uds_result_t uds_security_request_seed(uds_ctx_t *ctx,
+                                      uds_response_t *response);
+uds_result_t uds_security_send_key(uds_ctx_t *ctx, const uint8_t *key,
+                                   uds_response_t *response);
+uds_result_t uds_validate_write_data_by_identifier(
+    const uds_request_t *request);
+uds_result_t uds_handle_write_data_by_identifier(
+    uds_ctx_t *ctx, const uds_request_t *request,
+    uds_response_t *response);
+uds_result_t uds_validate_read_dtc_information(
+    const uds_request_t *request);
+uds_result_t uds_handle_read_dtc_information(
+    uds_ctx_t *ctx, const uds_request_t *request,
+    uds_response_t *response);
 uds_result_t uds_handle_read_data_by_identifier(
     uds_ctx_t *ctx, const uds_request_t *request,
     uds_response_t *response);
 uds_result_t uds_data_read_did(uint16_t did, uint8_t *data,
                                uint16_t capacity, uint16_t *len);
+uds_result_t uds_data_validate_write(uint16_t did, uint16_t len);
+uds_result_t uds_data_write_did(uint16_t did, const uint8_t *data,
+                                uint16_t len);
+uds_result_t uds_data_read_dtcs(uint8_t status_mask, uint8_t *data,
+                                uint16_t capacity, uint16_t *len);
+uint32_t     uds_compute_key(uint32_t seed);
 
 #endif

@@ -112,6 +112,10 @@ def test_uds_busy_slot_replies_after_tx_completion_or_timeout(isotp_harness):
     run_harness(isotp_harness, "uds-busy")
 
 
+def test_init_failure_and_repeated_deinit_do_not_leak_timer_fds(isotp_harness):
+    run_harness(isotp_harness, "lifecycle")
+
+
 def test_seven_byte_single_frame_reaches_uds(ecu_process, vcan_interface):
     with UdsClient(vcan_interface) as client:
         response = client.request(bytes.fromhex("10 03 00 00 00 00 00"))

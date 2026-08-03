@@ -3,6 +3,8 @@
 #include "uds.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/timerfd.h>
 #include <time.h>
@@ -22,6 +24,30 @@ static const uds_service_entry_t service_table[] = {
         .handle = uds_handle_diagnostic_session_control,
     },
     {
+        .sid = UDS_SID_READ_DTC_INFORMATION,
+        .session_mask = UDS_SESSION_MASK_DEFAULT |
+                        UDS_SESSION_MASK_EXTENDED,
+        .need_security = false,
+        .has_subfunction = true,
+        .supports_suppress = false,
+        .min_len = 3u,
+        .max_len = 3u,
+        .validate = uds_validate_read_dtc_information,
+        .handle = uds_handle_read_dtc_information,
+    },
+    {
+        .sid = UDS_SID_TESTER_PRESENT,
+        .session_mask = UDS_SESSION_MASK_DEFAULT |
+                        UDS_SESSION_MASK_EXTENDED,
+        .need_security = false,
+        .has_subfunction = true,
+        .supports_suppress = true,
+        .min_len = 2u,
+        .max_len = 2u,
+        .validate = uds_validate_tester_present,
+        .handle = uds_handle_tester_present,
+    },
+    {
         .sid = UDS_SID_READ_DATA_BY_IDENTIFIER,
         .session_mask = UDS_SESSION_MASK_DEFAULT |
                         UDS_SESSION_MASK_EXTENDED,
@@ -33,7 +59,290 @@ static const uds_service_entry_t service_table[] = {
         .validate = NULL,
         .handle = uds_handle_read_data_by_identifier,
     },
+    {
+        .sid = UDS_SID_WRITE_DATA_BY_IDENTIFIER,
+        .session_mask = UDS_SESSION_MASK_EXTENDED,
+        .need_security = true,
+        .has_subfunction = false,
+        .supports_suppress = false,
+        .min_len = 4u,
+        .max_len = 20u,
+        .validate = uds_validate_write_data_by_identifier,
+        .handle = uds_handle_write_data_by_identifier,
+    },
+    {
+        .sid = UDS_SID_SECURITY_ACCESS,
+        .session_mask = UDS_SESSION_MASK_EXTENDED,
+        .need_security = false,
+        .has_subfunction = true,
+        .supports_suppress = false,
+        .min_len = 2u,
+        .max_len = 6u,
+        .validate = uds_validate_security_access,
+        .handle = uds_handle_security_access,
+    },
 };
+
+static uint64_t uds_monotonic_now_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        return 0u;
+    }
+    return (uint64_t)now.tv_sec * 1000000000ULL +
+           (uint64_t)now.tv_nsec;
+}
+
+static bool uds_security_lock_active(uds_ctx_t *ctx)
+{
+    uint64_t now;
+
+    if (ctx->security_lock_until_ns == 0u) {
+        return false;
+    }
+    now = uds_monotonic_now_ns();
+    if (now != 0u && now >= ctx->security_lock_until_ns) {
+        ctx->security_lock_until_ns = 0u;
+        ctx->security_failed_attempts = 0u;
+        return false;
+    }
+    return true;
+}
+
+/*
+ * SecurityAccess state transitions:
+ * LOCKED --27 01--> SEED_SENT --correct key--> UNLOCKED
+ * SEED_SENT --wrong key (1/2)--> SEED_SENT
+ * SEED_SENT --wrong key (3)--> LOCKED + lockout deadline
+ * session switch / S3 expiry --> LOCKED + invalidate seed
+ */
+static void uds_security_clear_seed(uds_ctx_t *ctx)
+{
+    ctx->security_seed = 0u;
+    ctx->security_seed_valid = false;
+    ctx->security_state = UDS_SECURITY_LOCKED;
+}
+
+static int uds_read_random_seed(uint32_t *seed)
+{
+    uint8_t bytes[sizeof(*seed)];
+    int random_fd;
+    size_t offset = 0u;
+
+    if (seed == NULL) {
+        return -EINVAL;
+    }
+    random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (random_fd < 0) {
+        return -errno;
+    }
+    while (offset < sizeof(bytes)) {
+        ssize_t count = read(random_fd, bytes + offset,
+                             sizeof(bytes) - offset);
+
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            int error = count == 0 ? EIO : errno;
+            (void)close(random_fd);
+            return -error;
+        }
+        offset += (size_t)count;
+    }
+    (void)close(random_fd);
+    *seed = ((uint32_t)bytes[0] << 24u) |
+            ((uint32_t)bytes[1] << 16u) |
+            ((uint32_t)bytes[2] << 8u) |
+            (uint32_t)bytes[3];
+    return 0;
+}
+
+static bool uds_seed_is_degenerate(uint32_t seed)
+{
+    return seed == 0u || seed == UINT32_MAX;
+}
+
+static int uds_generate_seed(uint32_t *seed)
+{
+    for (unsigned int attempt = 0u; attempt < 16u; ++attempt) {
+        int result = uds_read_random_seed(seed);
+
+        if (result < 0) {
+            return result;
+        }
+        if (!uds_seed_is_degenerate(*seed)) {
+            return 0;
+        }
+    }
+    return -EIO;
+}
+
+static uint32_t uds_read_be32(const uint8_t *data)
+{
+    return ((uint32_t)data[0] << 24u) |
+           ((uint32_t)data[1] << 16u) |
+           ((uint32_t)data[2] << 8u) |
+           (uint32_t)data[3];
+}
+
+static int uds_drain_s3_timer(uds_ctx_t *ctx)
+{
+    uint64_t expirations;
+    ssize_t bytes_read;
+
+    for (;;) {
+        do {
+            bytes_read = read(ctx->s3_timer_fd, &expirations,
+                              sizeof(expirations));
+        } while (bytes_read < 0 && errno == EINTR);
+
+        if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+        if (bytes_read < 0) {
+            return -errno;
+        }
+        if ((size_t)bytes_read != sizeof(expirations)) {
+            return -EIO;
+        }
+    }
+}
+
+static int uds_stop_s3_timer(uds_ctx_t *ctx)
+{
+    const struct itimerspec disarmed = {0};
+
+    if (timerfd_settime(ctx->s3_timer_fd, 0, &disarmed, NULL) < 0) {
+        return -errno;
+    }
+    return uds_drain_s3_timer(ctx);
+}
+
+static int uds_start_s3_timer(uds_ctx_t *ctx)
+{
+    struct itimerspec value = {0};
+    int result;
+
+    result = uds_stop_s3_timer(ctx);
+    if (result < 0) {
+        return result;
+    }
+    value.it_value.tv_sec = UDS_S3_TIMEOUT_MS / 1000u;
+    value.it_value.tv_nsec = (long)(UDS_S3_TIMEOUT_MS % 1000u) * 1000000L;
+    if (timerfd_settime(ctx->s3_timer_fd, 0, &value, NULL) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+static int uds_refresh_s3(uds_ctx_t *ctx)
+{
+    if (ctx->session == UDS_SESSION_EXTENDED) {
+        return uds_start_s3_timer(ctx);
+    }
+    return uds_stop_s3_timer(ctx);
+}
+
+static int uds_apply_session_control(uds_ctx_t *ctx, uint8_t subfunction)
+{
+    int result;
+
+    if (subfunction == 0x03u) {
+        result = uds_start_s3_timer(ctx);
+        if (result < 0) {
+            return result;
+        }
+        ctx->session = UDS_SESSION_EXTENDED;
+    } else {
+        result = uds_stop_s3_timer(ctx);
+        if (result < 0) {
+            return result;
+        }
+        ctx->session = UDS_SESSION_DEFAULT;
+    }
+    uds_security_clear_seed(ctx);
+    return 0;
+}
+
+uds_result_t uds_security_request_seed(uds_ctx_t *ctx,
+                                      uds_response_t *response)
+{
+    uint32_t seed;
+    int result;
+
+    if (ctx == NULL || response == NULL || response->data == NULL ||
+        response->capacity < 6u) {
+        return UDS_ERROR_GENERAL_REJECT;
+    }
+    if (uds_security_lock_active(ctx)) {
+        return UDS_ERROR_DELAY_NOT_EXPIRED;
+    }
+    result = uds_generate_seed(&seed);
+    if (result < 0) {
+        return UDS_ERROR_GENERAL_REJECT;
+    }
+
+    ctx->security_seed = seed;
+    ctx->security_seed_valid = true;
+    ctx->security_state = UDS_SECURITY_SEED_SENT;
+    response->data[0] = UDS_SID_SECURITY_ACCESS +
+                        UDS_POSITIVE_RESPONSE_OFFSET;
+    response->data[1] = 0x01u;
+    response->data[2] = (uint8_t)(seed >> 24u);
+    response->data[3] = (uint8_t)(seed >> 16u);
+    response->data[4] = (uint8_t)(seed >> 8u);
+    response->data[5] = (uint8_t)seed;
+    response->len = 6u;
+    return UDS_RESULT_OK;
+}
+
+uds_result_t uds_security_send_key(uds_ctx_t *ctx, const uint8_t *key,
+                                   uds_response_t *response)
+{
+    uint32_t provided_key;
+    uint32_t expected_key;
+
+    if (ctx == NULL || key == NULL || response == NULL ||
+        response->data == NULL || response->capacity < 2u) {
+        return UDS_ERROR_GENERAL_REJECT;
+    }
+    if (!ctx->security_seed_valid ||
+        ctx->security_state != UDS_SECURITY_SEED_SENT) {
+        return UDS_ERROR_SEQUENCE;
+    }
+
+    provided_key = uds_read_be32(key);
+    expected_key = uds_compute_key(ctx->security_seed);
+    if (provided_key != expected_key) {
+        if (ctx->security_failed_attempts < UDS_SECURITY_MAX_ATTEMPTS) {
+            ctx->security_failed_attempts++;
+        }
+        if (ctx->security_failed_attempts >= UDS_SECURITY_MAX_ATTEMPTS) {
+            uint64_t now = uds_monotonic_now_ns();
+
+            uds_security_clear_seed(ctx);
+            ctx->security_lock_until_ns = now == 0u
+                                              ? UINT64_MAX
+                                              : now +
+                                                    (uint64_t)UDS_SECURITY_LOCKOUT_MS *
+                                                        1000000ULL;
+            return UDS_ERROR_ATTEMPTS_EXCEEDED;
+        }
+        return UDS_ERROR_INVALID_KEY;
+    }
+
+    uds_security_clear_seed(ctx);
+    ctx->security_state = UDS_SECURITY_UNLOCKED;
+    ctx->security_failed_attempts = 0u;
+    ctx->security_lock_until_ns = 0u;
+    response->data[0] = UDS_SID_SECURITY_ACCESS +
+                        UDS_POSITIVE_RESPONSE_OFFSET;
+    response->data[1] = 0x02u;
+    response->len = 2u;
+    return UDS_RESULT_OK;
+}
 
 static uint8_t uds_session_mask(uds_session_t session)
 {
@@ -135,6 +444,7 @@ void uds_deinit(uds_ctx_t *ctx)
     }
 
     if (ctx->s3_timer_fd >= 0) {
+        (void)uds_stop_s3_timer(ctx);
         (void)close(ctx->s3_timer_fd);
     }
     (void)memset(ctx, 0, sizeof(*ctx));
@@ -194,6 +504,12 @@ void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
         uds_send_negative(ctx, request.sid, result);
         return;
     }
+    if (service->sid != UDS_SID_DIAGNOSTIC_SESSION_CONTROL) {
+        if (uds_refresh_s3(ctx) < 0) {
+            uds_send_negative(ctx, request.sid, UDS_ERROR_GENERAL_REJECT);
+            return;
+        }
+    }
     if (service->need_security &&
         ctx->security_state != UDS_SECURITY_UNLOCKED) {
         uds_send_negative(ctx, request.sid, UDS_ERROR_SECURITY_DENIED);
@@ -206,6 +522,11 @@ void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
     result = service->handle(ctx, &request, &response);
     if (result != UDS_RESULT_OK) {
         uds_send_negative(ctx, request.sid, result);
+        return;
+    }
+    if (service->sid == UDS_SID_DIAGNOSTIC_SESSION_CONTROL &&
+        uds_apply_session_control(ctx, request.subfunction) < 0) {
+        uds_send_negative(ctx, request.sid, UDS_ERROR_GENERAL_REJECT);
         return;
     }
     if (request.suppress_positive) {
@@ -262,6 +583,11 @@ int uds_on_s3_timer(uds_ctx_t *ctx)
     }
     if ((size_t)bytes_read != sizeof(expirations)) {
         return -EIO;
+    }
+    if (expirations != 0u) {
+        ctx->session = UDS_SESSION_DEFAULT;
+        uds_security_clear_seed(ctx);
+        return uds_stop_s3_timer(ctx);
     }
     return 0;
 }
