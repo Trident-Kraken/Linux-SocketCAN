@@ -33,6 +33,7 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(isotp_rx_harness
         tests/isotp_rx_harness.c
+        src/can_driver.c
         src/isotp.c
         src/uds_engine.c
         src/uds_services.c

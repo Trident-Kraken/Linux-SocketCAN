@@ -150,6 +150,12 @@ static void isotp_finish_tx(isotp_ctx_t *ctx, int status)
     ctx->config.on_tx_done(status, ctx->config.user);
 }
 
+static int isotp_send_can_frame(isotp_ctx_t *ctx, const can_frame_t *frame)
+{
+    return ctx->config.frame_sender.send(ctx->config.frame_sender.context,
+                                         frame);
+}
+
 static bool isotp_padding_valid(const can_frame_t *frame, uint8_t first_unused)
 {
     for (uint8_t index = first_unused; index < CAN_CLASSIC_DLEN; ++index) {
@@ -170,7 +176,7 @@ static int isotp_send_flow_control(isotp_ctx_t *ctx)
     frame.data[0] = (uint8_t)(ISOTP_PCI_FC | ISOTP_FC_CTS);
     frame.data[1] = ISOTP_FC_BS;
     frame.data[2] = ISOTP_FC_STMIN;
-    return can_send(ctx->config.can, &frame);
+    return isotp_send_can_frame(ctx, &frame);
 }
 
 static int isotp_send_first_frame(isotp_ctx_t *ctx)
@@ -185,7 +191,7 @@ static int isotp_send_first_frame(isotp_ctx_t *ctx)
                                ISOTP_FF_LEN_HIGH_MASK));
     frame.data[1] = (uint8_t)(ctx->tx_total_len & 0xFFu);
     (void)memcpy(&frame.data[2], ctx->tx_buffer, 6u);
-    return can_send(ctx->config.can, &frame);
+    return isotp_send_can_frame(ctx, &frame);
 }
 
 static int isotp_send_consecutive_frame(isotp_ctx_t *ctx,
@@ -207,7 +213,7 @@ static int isotp_send_consecutive_frame(isotp_ctx_t *ctx,
     (void)memset(frame.data, ISOTP_PADDING_BYTE, sizeof(frame.data));
     frame.data[0] = (uint8_t)(ISOTP_PCI_CF | ctx->tx_next_sn);
     (void)memcpy(&frame.data[1], &ctx->tx_buffer[ctx->tx_offset], length);
-    result = can_send(ctx->config.can, &frame);
+    result = isotp_send_can_frame(ctx, &frame);
     if (result < 0) {
         return result;
     }
@@ -406,7 +412,8 @@ int isotp_init(isotp_ctx_t *ctx, const isotp_config_t *config)
 {
     int timer_index;
 
-    if (ctx == NULL || config == NULL || config->can == NULL ||
+    if (ctx == NULL || config == NULL || config->frame_sender.context == NULL ||
+        config->frame_sender.send == NULL ||
         config->on_message == NULL || config->on_tx_done == NULL ||
         config->rx_id > CAN_STANDARD_ID_MAX ||
         config->tx_id > CAN_STANDARD_ID_MAX) {
@@ -482,7 +489,7 @@ int isotp_send(isotp_ctx_t *ctx, const uint8_t *data, uint16_t len)
         frame.data[0] = (uint8_t)len;
         (void)memcpy(&frame.data[1], ctx->tx_buffer, len);
 
-        send_result = can_send(ctx->config.can, &frame);
+        send_result = isotp_send_can_frame(ctx, &frame);
         isotp_finish_tx(ctx, send_result);
         return 0;
     }

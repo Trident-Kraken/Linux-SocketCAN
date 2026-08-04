@@ -13,6 +13,14 @@ typedef struct {
     uint8_t  data[CAN_CLASSIC_DLEN];
 } can_frame_t;
 
+typedef int (*can_frame_send_fn_t)(void *context,
+                                   const can_frame_t *frame);
+
+typedef struct {
+    void                *context;
+    can_frame_send_fn_t send;
+} can_frame_sender_t;
+
 typedef struct {
     uint64_t frames_rx;
     uint64_t frames_tx;
@@ -32,6 +40,7 @@ void               can_close(can_driver_t *driver);
 int                can_get_fd(const can_driver_t *driver);
 int                can_recv(can_driver_t *driver, can_frame_t *frame);
 int                can_send(can_driver_t *driver, const can_frame_t *frame);
+can_frame_sender_t can_driver_frame_sender(can_driver_t *driver);
 const can_stats_t *can_get_stats(const can_driver_t *driver);
 
 #endif

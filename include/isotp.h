@@ -16,7 +16,7 @@ typedef void (*isotp_rx_cb_t)(const uint8_t *data, uint16_t len, void *user);
 typedef void (*isotp_tx_done_cb_t)(int status, void *user);
 
 typedef struct {
-    can_driver_t      *can;
+    can_frame_sender_t frame_sender;
     uint32_t           rx_id;
     uint32_t           tx_id;
     isotp_rx_cb_t      on_message;

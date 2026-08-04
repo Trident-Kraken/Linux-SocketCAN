@@ -194,7 +194,7 @@ int main(int argc, char **argv)
     }
 
     (void)memset(&isotp_config, 0, sizeof(isotp_config));
-    isotp_config.can = &driver;
+    isotp_config.frame_sender = can_driver_frame_sender(&driver);
     isotp_config.rx_id = request_id;
     isotp_config.tx_id = response_id;
     isotp_config.on_message = uds_on_isotp_message;

@@ -225,6 +225,19 @@ int can_send(can_driver_t *driver, const can_frame_t *frame)
     return 0;
 }
 
+static int can_driver_send_frame(void *context, const can_frame_t *frame)
+{
+    return can_send(context, frame);
+}
+
+can_frame_sender_t can_driver_frame_sender(can_driver_t *driver)
+{
+    return (can_frame_sender_t){
+        .context = driver,
+        .send = can_driver_send_frame,
+    };
+}
+
 const can_stats_t *can_get_stats(const can_driver_t *driver)
 {
     if (driver == NULL) {

@@ -26,6 +26,14 @@ typedef struct {
     unsigned int count;
 } capture_t;
 
+typedef struct {
+    can_frame_t      *frames;
+    struct timespec  *times;
+    size_t           *frame_count;
+    int              *forced_status;
+    size_t            capacity;
+} frame_capture_sender_t;
+
 static can_frame_t sent_frames[TEST_MAX_SENT_FRAMES];
 static struct timespec sent_times[TEST_MAX_SENT_FRAMES];
 static size_t sent_frame_count;
@@ -33,6 +41,13 @@ static unsigned int tx_done_count;
 static int last_tx_status;
 static int forced_send_status;
 static capture_t capture;
+static frame_capture_sender_t frame_capture_sender = {
+    .frames = sent_frames,
+    .times = sent_times,
+    .frame_count = &sent_frame_count,
+    .forced_status = &forced_send_status,
+    .capacity = TEST_MAX_SENT_FRAMES,
+};
 
 static bool force_timer_expiry(isotp_ctx_t *ctx, isotp_timer_t timer_type);
 static bool drive_stmin_timer(isotp_ctx_t *ctx, size_t target_frame_count);
@@ -43,20 +58,32 @@ static bool uds_s3_timer_active(const uds_ctx_t *uds);
 static bool set_uds_s3_timer_ms(const uds_ctx_t *uds,
                                 unsigned int milliseconds);
 
-int can_send(can_driver_t *driver, const can_frame_t *frame)
+static int capture_can_frame(void *context, const can_frame_t *frame)
 {
-    (void)driver;
-    if (forced_send_status != 0) {
-        return forced_send_status;
-    }
-    if (frame == NULL || sent_frame_count >= sizeof(sent_frames) /
-                            sizeof(sent_frames[0])) {
+    frame_capture_sender_t *sender = context;
+    size_t index;
+
+    if (sender == NULL || sender->frames == NULL || sender->times == NULL ||
+        sender->frame_count == NULL || sender->forced_status == NULL) {
         return -EINVAL;
     }
-    sent_frames[sent_frame_count++] = *frame;
-    (void)clock_gettime(CLOCK_MONOTONIC, &sent_times[sent_frame_count - 1u]);
+    if (*sender->forced_status != 0) {
+        return *sender->forced_status;
+    }
+    index = *sender->frame_count;
+    if (frame == NULL || index >= sender->capacity) {
+        return -EINVAL;
+    }
+    sender->frames[index] = *frame;
+    (void)clock_gettime(CLOCK_MONOTONIC, &sender->times[index]);
+    *sender->frame_count = index + 1u;
     return 0;
 }
+
+static const can_frame_sender_t test_frame_sender = {
+    .context = &frame_capture_sender,
+    .send = capture_can_frame,
+};
 
 static void on_message(const uint8_t *data, uint16_t len, void *user)
 {
@@ -104,12 +131,12 @@ static void init_frame(can_frame_t *frame)
     (void)memset(frame->data, ISOTP_PADDING_BYTE, sizeof(frame->data));
 }
 
-static void init_context(isotp_ctx_t *ctx, can_driver_t *driver)
+static void init_context(isotp_ctx_t *ctx)
 {
     isotp_config_t config = {0};
     int result;
 
-    config.can = driver;
+    config.frame_sender = test_frame_sender;
     config.rx_id = TEST_RX_ID;
     config.tx_id = TEST_TX_ID;
     config.on_message = on_message;
@@ -233,7 +260,6 @@ static bool check_tx_frame(const can_frame_t *frame, uint8_t pci,
 
 static bool scenario_basic(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     uint8_t payload[20];
     bool result = true;
@@ -242,7 +268,7 @@ static bool scenario_basic(void)
     for (size_t index = 0; index < sizeof(payload); ++index) {
         payload[index] = (uint8_t)(index + 1u);
     }
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = send_ff(&ctx, sizeof(payload), payload) && check_fc();
     result = send_cf(&ctx, 1u, &payload[6], 7u) && result;
     result = send_cf(&ctx, 2u, &payload[13], 7u) && result;
@@ -258,7 +284,6 @@ static bool scenario_basic(void)
 
 static bool scenario_tx_basic(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t one[] = {0x10u};
     const uint8_t seven[] = {1u, 2u, 3u, 4u, 5u, 6u, 7u};
@@ -268,7 +293,7 @@ static bool scenario_tx_basic(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, one, sizeof(one)) == 0,
                    "one-byte SF is accepted") && result;
     result = check(sent_frame_count == 1u && tx_done_count == 1u &&
@@ -279,7 +304,7 @@ static bool scenario_tx_basic(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, seven, sizeof(seven)) == 0,
                    "seven-byte SF is accepted") && result;
     result = check(sent_frame_count == 1u && tx_done_count == 1u &&
@@ -290,7 +315,7 @@ static bool scenario_tx_basic(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, eight, sizeof(eight)) == 0,
                    "eight-byte payload is accepted") && result;
     result = check(sent_frame_count == 1u && tx_done_count == 0u &&
@@ -314,7 +339,7 @@ static bool scenario_tx_basic(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, one, 0u) == -EINVAL,
                    "zero-length TX is rejected") && result;
     result = check(isotp_send(&ctx, too_long, ISOTP_MAX_LEN + 1u) == -EINVAL,
@@ -328,7 +353,6 @@ static bool scenario_tx_basic(void)
 
 static bool scenario_tx_boundary(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     uint8_t payload[ISOTP_MAX_LEN];
     uint16_t offset = 6u;
@@ -339,7 +363,7 @@ static bool scenario_tx_boundary(void)
     for (size_t index = 0; index < sizeof(payload); ++index) {
         payload[index] = (uint8_t)((index * 29u + 3u) & 0xFFu);
     }
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "4095-byte TX is accepted") && result;
     result = check(sent_frame_count == 1u && isotp_tx_busy(&ctx),
@@ -385,7 +409,6 @@ static bool scenario_tx_boundary(void)
 
 static bool scenario_tx_flow_control(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     can_frame_t invalid_fc;
     can_frame_t single_frame;
@@ -396,7 +419,7 @@ static bool scenario_tx_flow_control(void)
         payload[index] = (uint8_t)(index + 1u);
     }
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "flow-control payload is accepted") && result;
     result = send_fc(&ctx, 3u, 4u, 0x0Au) && result;
@@ -447,7 +470,6 @@ static bool scenario_tx_flow_control(void)
 
 static bool scenario_tx_stmin_codes(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t payload[20] = {
         1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u,
@@ -456,7 +478,7 @@ static bool scenario_tx_stmin_codes(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "microsecond STmin payload is accepted") && result;
     result = send_fc(&ctx, 0u, 0u, 0xF1u) && result;
@@ -473,7 +495,7 @@ static bool scenario_tx_stmin_codes(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "reserved STmin payload is accepted") && result;
     result = send_fc(&ctx, 0u, 0u, 0x80u) && result;
@@ -498,14 +520,13 @@ static bool scenario_tx_stmin_codes(void)
 
 static bool scenario_tx_abort(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t payload[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
     const isotp_stats_t *stats;
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "Overflow test payload is accepted") && result;
     result = send_fc(&ctx, 2u, 0u, 0u) && result;
@@ -516,7 +537,7 @@ static bool scenario_tx_abort(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "N_Bs test payload is accepted") && result;
     result = force_timer_expiry(&ctx, ISOTP_TIMER_N_BS) && result;
@@ -534,7 +555,6 @@ static bool scenario_tx_abort(void)
 
 static bool scenario_tx_can_error(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     can_frame_t flow_control;
     const uint8_t short_payload[] = {1u};
@@ -542,7 +562,7 @@ static bool scenario_tx_can_error(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     forced_send_status = -EIO;
     result = check(isotp_send(&ctx, short_payload, sizeof(short_payload)) == 0,
                    "SF send failure is reported asynchronously") && result;
@@ -552,7 +572,7 @@ static bool scenario_tx_can_error(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     forced_send_status = -ENETDOWN;
     result = check(isotp_send(&ctx, multi_payload, sizeof(multi_payload)) == 0,
                    "FF send failure is reported asynchronously") && result;
@@ -562,7 +582,7 @@ static bool scenario_tx_can_error(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     forced_send_status = 0;
     result = check(isotp_send(&ctx, multi_payload, sizeof(multi_payload)) == 0,
                    "CF failure payload is accepted") && result;
@@ -580,14 +600,13 @@ static bool scenario_tx_can_error(void)
 
 static bool scenario_tx_cleanup_error(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t payload[] = {1u};
     int stmin_fd;
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     stmin_fd = isotp_timer_fd(&ctx, ISOTP_TIMER_STMIN);
     /* Fault injection only; normal callers must not close borrowed fds. */
     result = check(stmin_fd >= 0 && close(stmin_fd) == 0,
@@ -604,13 +623,12 @@ static bool scenario_tx_cleanup_error(void)
 
 static bool scenario_tx_wait_restart(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t payload[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = check(isotp_send(&ctx, payload, sizeof(payload)) == 0,
                    "N_Bs restart payload is accepted") && result;
     result = check(sleep_milliseconds(700L),
@@ -631,13 +649,12 @@ static bool scenario_tx_wait_restart(void)
     return result;
 }
 
-static bool init_uds_context(isotp_ctx_t *isotp, uds_ctx_t *uds,
-                             can_driver_t *driver)
+static bool init_uds_context(isotp_ctx_t *isotp, uds_ctx_t *uds)
 {
     isotp_config_t config = {0};
     int result;
 
-    config.can = driver;
+    config.frame_sender = test_frame_sender;
     config.rx_id = TEST_RX_ID;
     config.tx_id = TEST_TX_ID;
     config.on_message = uds_on_isotp_message;
@@ -657,7 +674,6 @@ static bool init_uds_context(isotp_ctx_t *isotp, uds_ctx_t *uds,
 
 static bool scenario_uds_busy(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
     const uint8_t tx_payload[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
@@ -666,7 +682,7 @@ static bool scenario_uds_busy(void)
     bool result = true;
 
     reset_capture();
-    result = check(init_uds_context(&isotp, &uds, &driver),
+    result = check(init_uds_context(&isotp, &uds),
                    "UDS busy context initializes") && result;
     result = check(isotp_send(&isotp, tx_payload, sizeof(tx_payload)) == 0,
                    "busy test starts a real multi-frame TX") && result;
@@ -685,7 +701,7 @@ static bool scenario_uds_busy(void)
     isotp_deinit(&isotp);
 
     reset_capture();
-    result = check(init_uds_context(&isotp, &uds, &driver),
+    result = check(init_uds_context(&isotp, &uds),
                    "UDS timeout context initializes") && result;
     result = check(isotp_send(&isotp, tx_payload, sizeof(tx_payload)) == 0,
                    "timeout busy test starts TX") && result;
@@ -705,7 +721,6 @@ static bool scenario_uds_busy(void)
 
 static bool scenario_uds_session_s3(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
     const uint8_t enter_extended[] = {0x10u, 0x03u};
@@ -723,7 +738,7 @@ static bool scenario_uds_session_s3(void)
     bool result = true;
 
     reset_capture();
-    result = check(init_uds_context(&isotp, &uds, &driver),
+    result = check(init_uds_context(&isotp, &uds),
                    "UDS session context initializes") && result;
     result = send_sf(&isotp, enter_extended, sizeof(enter_extended)) && result;
     result = check(sent_frame_count == 1u &&
@@ -839,7 +854,6 @@ static bool scenario_uds_session_s3(void)
 
 static bool scenario_uds_security(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
     const uint8_t enter_extended[] = {UDS_SID_DIAGNOSTIC_SESSION_CONTROL,
@@ -866,7 +880,7 @@ static bool scenario_uds_security(void)
     reset_capture();
     result = check(uds_compute_key(0x12345678u) == 0xF8FE924Cu,
                    "Seed-Key algorithm matches the specification") && result;
-    result = check(init_uds_context(&isotp, &uds, &driver),
+    result = check(init_uds_context(&isotp, &uds),
                    "UDS security context initializes") && result;
 
     result = send_sf(&isotp, request_seed, sizeof(request_seed)) && result;
@@ -1042,7 +1056,6 @@ static bool scenario_uds_security(void)
 
 static bool scenario_uds_did(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
     const uint8_t enter_extended[] = {UDS_SID_DIAGNOSTIC_SESSION_CONTROL,
@@ -1068,7 +1081,7 @@ static bool scenario_uds_did(void)
 
     (void)memcpy(&write_vin[3], vin, sizeof(vin) - 1u);
     reset_capture();
-    result = check(init_uds_context(&isotp, &uds, &driver),
+    result = check(init_uds_context(&isotp, &uds),
                    "UDS DID context initializes") && result;
 
     result = send_sf(&isotp, read_temperature, sizeof(read_temperature)) &&
@@ -1185,7 +1198,6 @@ static bool scenario_uds_did(void)
 
 static bool scenario_uds_dtc(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
     const uint8_t all_dtcs[] = {UDS_SID_READ_DTC_INFORMATION,
@@ -1202,7 +1214,7 @@ static bool scenario_uds_dtc(void)
     bool result = true;
 
     reset_capture();
-    result = check(init_uds_context(&isotp, &uds, &driver),
+    result = check(init_uds_context(&isotp, &uds),
                    "UDS DTC context initializes") && result;
 
     result = send_sf(&isotp, all_dtcs, sizeof(all_dtcs)) && result;
@@ -1281,7 +1293,6 @@ static bool scenario_uds_dtc(void)
 
 static bool scenario_boundary(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     uint8_t payload[ISOTP_MAX_LEN];
     uint16_t offset = 0u;
@@ -1292,7 +1303,7 @@ static bool scenario_boundary(void)
     for (size_t index = 0; index < sizeof(payload); ++index) {
         payload[index] = (uint8_t)((index * 37u + 11u) & 0xFFu);
     }
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = send_ff(&ctx, ISOTP_MAX_LEN, payload) && check_fc();
     offset = 6u;
     while (offset < ISOTP_MAX_LEN) {
@@ -1314,7 +1325,6 @@ static bool scenario_boundary(void)
 
 static bool scenario_sn_error(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t first[6] = {1u, 2u, 3u, 4u, 5u, 6u};
     const uint8_t next[7] = {7u, 8u, 9u, 10u, 11u, 12u, 13u};
@@ -1323,7 +1333,7 @@ static bool scenario_sn_error(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = send_ff(&ctx, 20u, first) && check_fc();
     result = send_cf(&ctx, 2u, next, sizeof(next)) && result;
     stats = isotp_get_stats(&ctx);
@@ -1421,7 +1431,6 @@ static uint64_t elapsed_us(const struct timespec *start,
 
 static bool scenario_timeout(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t first[6] = {1u, 2u, 3u, 4u, 5u, 6u};
     can_frame_t sf;
@@ -1429,7 +1438,7 @@ static bool scenario_timeout(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = send_ff(&ctx, 20u, first) && check_fc() && result;
     result = force_timer_expiry(&ctx, ISOTP_TIMER_N_CR) && result;
     result = check(isotp_on_timer(&ctx, ISOTP_TIMER_N_CR) == 0,
@@ -1452,7 +1461,6 @@ static bool scenario_timeout(void)
 
 static bool scenario_preempt(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     const uint8_t first[6] = {1u, 2u, 3u, 4u, 5u, 6u};
     const uint8_t replacement[6] = {9u, 8u, 7u, 6u, 5u, 4u};
@@ -1460,7 +1468,7 @@ static bool scenario_preempt(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = send_ff(&ctx, 20u, first) && result;
     result = send_ff(&ctx, 8u, replacement) && result;
     result = send_cf(&ctx, 1u, final_bytes, sizeof(final_bytes)) && result;
@@ -1472,7 +1480,7 @@ static bool scenario_preempt(void)
     isotp_deinit(&ctx);
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
     result = send_ff(&ctx, 20u, first) && result;
     {
         can_frame_t sf;
@@ -1493,7 +1501,6 @@ static bool scenario_preempt(void)
 
 static bool scenario_strict(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t ctx = {0};
     can_frame_t frame;
     const uint8_t first[6] = {1u, 2u, 3u, 4u, 5u, 6u};
@@ -1501,7 +1508,7 @@ static bool scenario_strict(void)
     bool result = true;
 
     reset_capture();
-    init_context(&ctx, &driver);
+    init_context(&ctx);
 
     init_frame(&frame);
     frame.dlc = 7u;
@@ -1541,11 +1548,10 @@ static bool scenario_strict(void)
 
 static bool scenario_lifecycle(void)
 {
-    can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
     isotp_config_t config = {
-        .can = &driver,
+        .frame_sender = test_frame_sender,
         .rx_id = TEST_RX_ID,
         .tx_id = TEST_TX_ID,
         .on_message = on_message,
@@ -1561,6 +1567,19 @@ static bool scenario_lifecycle(void)
     bool result = true;
 
     reset_capture();
+    {
+        isotp_config_t invalid_config = config;
+
+        invalid_config.frame_sender.send = NULL;
+        result = check(isotp_init(&isotp, &invalid_config) == -EINVAL,
+                       "ISO-TP rejects a missing CAN frame sender") &&
+                 result;
+        invalid_config = config;
+        invalid_config.frame_sender.context = NULL;
+        result = check(isotp_init(&isotp, &invalid_config) == -EINVAL,
+                       "ISO-TP rejects a CAN frame sender without context") &&
+                 result;
+    }
     open_fds = count_open_fds();
     result = check(open_fds >= 0, "current fd count is available") && result;
     result = check(getrlimit(RLIMIT_NOFILE, &original_limit) == 0,
