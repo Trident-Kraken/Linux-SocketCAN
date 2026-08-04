@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #define MAIN_MAX_EVENTS (2 + ISOTP_TIMER_COUNT)
+#define MAIN_CAN_RX_BUDGET 64u
 
 static volatile sig_atomic_t stop_requested;
 
@@ -109,7 +110,7 @@ static int main_add_epoll_fd(int epoll_fd, int fd)
 
 static int main_drain_can(can_driver_t *driver, isotp_ctx_t *isotp)
 {
-    for (;;) {
+    for (unsigned int frames = 0u; frames < MAIN_CAN_RX_BUDGET; ++frames) {
         can_frame_t frame;
         int result = can_recv(driver, &frame);
 
@@ -125,6 +126,7 @@ static int main_drain_can(can_driver_t *driver, isotp_ctx_t *isotp)
             return result;
         }
     }
+    return 0;
 }
 
 int main(int argc, char **argv)
