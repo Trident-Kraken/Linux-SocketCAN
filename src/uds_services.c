@@ -19,7 +19,6 @@ uds_result_t uds_handle_diagnostic_session_control(
     uds_ctx_t *ctx, const uds_request_t *request,
     uds_response_t *response)
 {
-    (void)ctx;
     if (ctx == NULL || request == NULL || response == NULL ||
         response->capacity < 6u) {
         return UDS_ERROR_GENERAL_REJECT;
@@ -51,7 +50,6 @@ uds_result_t uds_handle_tester_present(
     uds_ctx_t *ctx, const uds_request_t *request,
     uds_response_t *response)
 {
-    (void)ctx;
     if (ctx == NULL || request == NULL || response == NULL ||
         response->capacity < 2u) {
         return UDS_ERROR_GENERAL_REJECT;

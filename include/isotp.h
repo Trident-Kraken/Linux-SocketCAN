@@ -70,6 +70,13 @@ typedef struct {
 int                  isotp_init(isotp_ctx_t *ctx,
                                 const isotp_config_t *config);
 void                 isotp_deinit(isotp_ctx_t *ctx);
+/*
+ * Returns 0 when the payload is accepted (copied into the TX buffer),
+ * not when it reaches the bus. Every accepted call produces exactly one
+ * on_tx_done() — including synchronous SF/FF CAN send failures, which
+ * may fire before isotp_send() returns. Negative returns reject the
+ * request without any completion callback.
+ */
 int                  isotp_send(isotp_ctx_t *ctx, const uint8_t *data,
                                 uint16_t len);
 bool                 isotp_tx_busy(const isotp_ctx_t *ctx);

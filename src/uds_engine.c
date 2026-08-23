@@ -584,12 +584,10 @@ int uds_on_s3_timer(uds_ctx_t *ctx)
     if ((size_t)bytes_read != sizeof(expirations)) {
         return -EIO;
     }
-    if (expirations != 0u) {
-        ctx->session = UDS_SESSION_DEFAULT;
-        uds_security_clear_seed(ctx);
-        return uds_stop_s3_timer(ctx);
-    }
-    return 0;
+    /* A successful timerfd read always reports at least one expiration. */
+    ctx->session = UDS_SESSION_DEFAULT;
+    uds_security_clear_seed(ctx);
+    return uds_stop_s3_timer(ctx);
 }
 
 const uds_stats_t *uds_get_stats(const uds_ctx_t *ctx)
