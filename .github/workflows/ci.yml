@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.build_type }} build + pytest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Debug 构建启用 ASan/UBSan，与 Release 分别复现本地验证流程
+        build_type: [Release, Debug]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install can-utils
+        run: sudo apt-get update && sudo apt-get install -y can-utils
+
+      - name: Create vcan0
+        run: |
+          if sudo modprobe vcan 2>/dev/null; then
+            :
+          elif sudo apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 \
+               && sudo modprobe vcan 2>/dev/null; then
+            echo "vcan module installed via linux-modules-extra-$(uname -r)"
+          else
+            echo "::warning::vcan kernel module unavailable on $(uname -r) — SocketCAN integration tests will be skipped"
+            exit 0
+          fi
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+          ip -details link show vcan0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+
+      - name: Configure and build (${{ matrix.build_type }})
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build --parallel
+
+      - name: Run pytest
+        run: |
+          .venv/bin/python -m pytest tests/ -v \
+            --ecu-binary=build/vuds_ecu \
+            --isotp-harness=build/isotp_rx_harness
+
+      - name: Run privileged interface-down test (Release only)
+        if: matrix.build_type == 'Release'
+        run: |
+          sudo .venv/bin/python -m pytest \
+            "tests/test_robustness.py::test_interface_down_exits_cleanly_and_allows_restart" \
+            -v -p no:cacheprovider \
+            --ecu-binary=build/vuds_ecu
