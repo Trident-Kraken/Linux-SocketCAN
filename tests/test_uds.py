@@ -1,6 +1,7 @@
 """UDS service integration tests."""
 
 import subprocess
+import time
 
 import can
 import isotp
@@ -12,7 +13,7 @@ def run_harness(harness, scenario):
     subprocess.run([str(harness), scenario], check=True)
 
 
-def start_isotp_stack(interface):
+def start_isotp_stack(interface, blocksize=8, stmin=0):
     bus = can.Bus(interface="socketcan", channel=interface)
     stack = isotp.CanStack(
         bus,
@@ -26,6 +27,8 @@ def start_isotp_stack(interface):
             "tx_data_min_length": 8,
             "tx_padding": 0xAA,
             "max_frame_size": 4095,
+            "blocksize": blocksize,
+            "stmin": stmin,
             "blocking_send": False,
         },
     )
@@ -393,6 +396,114 @@ def test_long_write_uses_isotp_rx_and_updates_vin(ecu_process, vcan_interface):
         assert stack.recv(block=True, timeout=1.0) == (
             bytes.fromhex("62 F1 90") + new_vin
         )
+    finally:
+        stack.stop()
+        bus.shutdown()
+
+
+def test_extended_session_suppress_positive_switches_session(
+    ecu_process, vcan_interface
+):
+    with UdsClient(vcan_interface) as client:
+        client.send_raw_frame(bytes.fromhex("02 10 83 AA AA AA AA AA"))
+        assert client.receive(timeout=0.1) is None
+        assert client.request(bytes.fromhex("2E 02 00 00 C8")) == bytes.fromhex(
+            "7F 2E 33"
+        )
+
+
+def test_s3_timeout_falls_back_to_default_and_tester_present_keeps_session_alive(
+    ecu_process, vcan_interface
+):
+    with UdsClient(vcan_interface) as client:
+        assert client.request(bytes.fromhex("10 03")) == bytes.fromhex(
+            "50 03 00 32 01 F4"
+        )
+        time.sleep(3.0)
+        client.send_raw_frame(bytes.fromhex("02 3E 80 AA AA AA AA AA"))
+        assert client.receive(timeout=0.1) is None
+        time.sleep(3.0)
+        assert client.request(bytes.fromhex("2E 02 00 00 C8")) == bytes.fromhex(
+            "7F 2E 33"
+        )
+        time.sleep(5.5)
+        assert client.request(bytes.fromhex("2E 02 00 00 C8")) == bytes.fromhex(
+            "7F 2E 7F"
+        )
+
+
+def test_busy_request_during_multiframe_vin_tx_receives_nrc_21_without_side_effect(
+    ecu_process, vcan_interface
+):
+    bus = can.Bus(
+        interface="socketcan",
+        channel=vcan_interface,
+        can_filters=[
+            {"can_id": 0x7E8, "can_mask": 0x7FF, "extended": False}
+        ],
+    )
+
+    def send_7e0(hex_payload):
+        bus.send(
+            can.Message(
+                arbitration_id=0x7E0,
+                data=bytes.fromhex(hex_payload),
+                is_extended_id=False,
+            )
+        )
+
+    try:
+        send_7e0("02 10 03 AA AA AA AA AA")
+        msg = bus.recv(0.5)
+        assert msg is not None
+        assert bytes(msg.data) == bytes.fromhex("06 50 03 00 32 01 F4 AA")
+
+        send_7e0("03 22 F1 90 AA AA AA AA")
+        ff = bus.recv(0.5)
+        assert ff is not None
+        assert bytes(ff.data) == bytes.fromhex("10 14 62 F1 90 4C 56 55")
+
+        send_7e0("02 10 01 AA AA AA AA AA")
+        assert bus.recv(0.05) is None
+
+        send_7e0("30 00 00 AA AA AA AA AA")
+        cf1 = bus.recv(0.5)
+        cf2 = bus.recv(0.5)
+        busy_nrc = bus.recv(0.5)
+        assert cf1 is not None
+        assert cf2 is not None
+        assert busy_nrc is not None
+        assert bytes(cf1.data) == bytes.fromhex("21 44 53 32 30 32 36 44")
+        assert bytes(cf2.data) == bytes.fromhex("22 45 4D 4F 30 30 30 31")
+        assert bytes(busy_nrc.data) == bytes.fromhex("03 7F 10 21 AA AA AA AA")
+
+        send_7e0("05 2E 02 00 00 C8 AA AA")
+        verify = bus.recv(0.5)
+        assert verify is not None
+        assert bytes(verify.data) == bytes.fromhex("03 7F 2E 33 AA AA AA AA")
+    finally:
+        bus.shutdown()
+
+
+def test_vin_multiframe_tx_respects_reference_isotp_blocksize_and_stmin(
+    ecu_process, vcan_interface
+):
+    expected = bytes.fromhex("62 F1 90") + b"LVUDS2026DEMO0001"
+
+    bus, stack = start_isotp_stack(vcan_interface, blocksize=1, stmin=0)
+    try:
+        stack.send(bytes.fromhex("22 F1 90"))
+        assert stack.recv(block=True, timeout=1.0) == expected
+    finally:
+        stack.stop()
+        bus.shutdown()
+
+    bus, stack = start_isotp_stack(vcan_interface, blocksize=0, stmin=20)
+    try:
+        started = time.monotonic()
+        stack.send(bytes.fromhex("22 F1 90"))
+        assert stack.recv(block=True, timeout=1.0) == expected
+        assert time.monotonic() - started >= 0.010
     finally:
         stack.stop()
         bus.shutdown()

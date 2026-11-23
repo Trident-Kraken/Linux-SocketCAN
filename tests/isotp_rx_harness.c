@@ -373,7 +373,7 @@ static bool scenario_tx_boundary(void)
                        memcmp(&sent_frames[0].data[2], payload, 6u) == 0,
                    "4095-byte FF is encoded correctly") && result;
     result = send_fc(&ctx, 0u, 0u, 0u) && result;
-    while (tx_done_count == 0u) {
+    while (result && tx_done_count == 0u) {
         result = drive_stmin_timer(&ctx, sent_frame_count + 1u) && result;
     }
     result = check(sent_frame_count == 586u && tx_done_count == 1u &&
@@ -509,7 +509,7 @@ static bool scenario_tx_stmin_codes(void)
     result = check(isotp_on_timer(&ctx, ISOTP_TIMER_STMIN) == 0 &&
                        sent_frame_count == 2u && tx_done_count == 0u,
                    "reserved STmin is not treated as zero") && result;
-    while (tx_done_count == 0u) {
+    while (result && tx_done_count == 0u) {
         result = drive_stmin_timer(&ctx, sent_frame_count + 1u) && result;
     }
     result = check(sent_frame_count == 3u && last_tx_status == 0,
@@ -762,10 +762,24 @@ static bool scenario_uds_session_s3(void)
                    "valid TesterPresent re-arms the five-second S3 timer") &&
              result;
 
+    {
+        const uint8_t enter_default[] = {
+            UDS_SID_DIAGNOSTIC_SESSION_CONTROL, 0x01u,
+        };
+
+        result = send_sf(&isotp, enter_default, sizeof(enter_default)) &&
+                 result;
+        result = check(uds.session == UDS_SESSION_DEFAULT &&
+                           !uds_s3_timer_active(&uds),
+                       "10 01 returns to default session and disarms S3") &&
+                 result;
+    }
+    reset_capture();
     result = send_sf(&isotp, suppress_extended, sizeof(suppress_extended)) &&
              result;
     result = check(sent_frame_count == 0u &&
-                       uds.session == UDS_SESSION_EXTENDED,
+                       uds.session == UDS_SESSION_EXTENDED &&
+                       uds_s3_timer_active(&uds),
                    "10 83 changes session without a response") && result;
 
     uds.security_state = UDS_SECURITY_SEED_SENT;
@@ -967,7 +981,6 @@ static bool scenario_uds_security(void)
            ((uint32_t)sent_frames[0].data[4] << 16u) |
            ((uint32_t)sent_frames[0].data[5] << 8u) |
            (uint32_t)sent_frames[0].data[6];
-    old_seed = seed;
     key_request[2] = (uint8_t)(uds_compute_key(seed) >> 24u);
     key_request[3] = (uint8_t)(uds_compute_key(seed) >> 16u);
     key_request[4] = (uint8_t)(uds_compute_key(seed) >> 8u);
@@ -979,6 +992,26 @@ static bool scenario_uds_security(void)
                        uds.security_state == UDS_SECURITY_UNLOCKED &&
                        !uds.security_seed_valid,
                    "correct key unlocks and invalidates the seed") && result;
+
+    reset_capture();
+    result = send_sf(&isotp, request_seed, sizeof(request_seed)) && result;
+    result = check(sent_frame_count == 1u &&
+                       check_tx_frame(&sent_frames[0], 0x06u,
+                                      (const uint8_t[]){expected_seed_prefix[0],
+                                                       expected_seed_prefix[1],
+                                                       0u, 0u, 0u, 0u},
+                                      6u) &&
+                       uds.security_state == UDS_SECURITY_UNLOCKED &&
+                       !uds.security_seed_valid,
+                   "requestSeed while unlocked returns zero seed and stays unlocked") &&
+             result;
+
+    result = send_sf(&isotp, (const uint8_t[]){
+                         UDS_SID_DIAGNOSTIC_SESSION_CONTROL, 0x01u},
+                     2u) && result;
+    result = send_sf(&isotp, enter_extended, sizeof(enter_extended)) && result;
+    result = check(uds.security_state == UDS_SECURITY_LOCKED,
+                   "session switch relocks after unlocked state") && result;
 
     reset_capture();
     result = send_sf(&isotp, request_seed, sizeof(request_seed)) && result;
@@ -1150,9 +1183,16 @@ static bool scenario_uds_did(void)
                                   5u),
                    "writable DID reads back the new value") && result;
 
-    reset_capture();
-    result = send_sf(&isotp, read_vin, sizeof(read_vin)) && result;
-    result = send_sf(&isotp, write_period, sizeof(write_period)) && result;
+    {
+        const uint8_t busy_write_period[] = {
+            UDS_SID_WRITE_DATA_BY_IDENTIFIER, 0x02u, 0x00u, 0x02u, 0x58u,
+        };
+
+        reset_capture();
+        result = send_sf(&isotp, read_vin, sizeof(read_vin)) && result;
+        result = send_sf(&isotp, busy_write_period,
+                         sizeof(busy_write_period)) && result;
+    }
     result = check(sent_frame_count == 1u && sent_frames[0].data[0] == 0x10u,
                    "busy write is held while VIN response is active") && result;
     result = send_fc(&isotp, 0u, 0u, 0u) && result;
@@ -1658,8 +1698,8 @@ int main(int argc, char **argv)
     if (argc != 2) {
         (void)fprintf(stderr,
                       "usage: %s basic|tx-basic|tx-boundary|tx-flow|"
-                      "tx-stmin|tx-abort|tx-wait|uds-busy|uds-security|uds-did|"
-                      "uds-dtc|"
+                      "tx-stmin|tx-abort|tx-wait|uds-busy|uds-session-s3|"
+                      "uds-security|uds-did|uds-dtc|"
                       "boundary|sn-error|"
                       "tx-can-error|tx-cleanup-error|timeout|"
                       "preempt|strict|lifecycle\n",

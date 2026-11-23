@@ -145,3 +145,20 @@ def test_security_access_lockout_and_lazy_recovery(
         recovered_seed = client.request_seed()
 
     assert recovered_seed not in (0, 0xFFFFFFFF)
+
+
+def test_request_seed_returns_zero_when_already_unlocked(
+    ecu_process, vcan_interface
+):
+    with UdsClient(vcan_interface) as client:
+        enter_extended_session(client)
+        seed = client.request_seed()
+        assert client.send_key(UdsClient.compute_key(seed)) == bytes.fromhex(
+            "67 02"
+        )
+        assert client.request(bytes.fromhex("27 01")) == bytes.fromhex(
+            "67 01 00 00 00 00"
+        )
+        assert client.request(bytes.fromhex("2E 02 00 01 2C")) == bytes.fromhex(
+            "6E 02 00"
+        )

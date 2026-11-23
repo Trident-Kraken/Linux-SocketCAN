@@ -2,7 +2,6 @@
 
 import re
 import shutil
-import signal
 import subprocess
 import time
 
@@ -47,8 +46,18 @@ def test_malformed_frames_do_not_prevent_following_valid_request(
         ),
         can.Message(
             arbitration_id=0x7E0,
-            data=bytes.fromhex("03 10 03 00 AA AA AA AA"),
+            data=bytes.fromhex("02 10 03 00 AA AA AA AA"),
             is_extended_id=False,
+        ),
+        can.Message(
+            arbitration_id=0x7E0,
+            is_extended_id=False,
+            is_remote_frame=True,
+        ),
+        can.Message(
+            arbitration_id=0x123457E0,
+            data=bytes.fromhex("02 10 03 AA AA AA AA AA"),
+            is_extended_id=True,
         ),
         can.Message(
             arbitration_id=0x7E0,
@@ -154,7 +163,7 @@ def test_interface_down_exits_cleanly_and_allows_restart(
     try:
         ecu_process.wait(timeout=2)
         _, stderr = ecu_process.communicate()
-        assert ecu_process.returncode != -signal.SIGSEGV
+        assert ecu_process.returncode == 1
         assert "event handling failed" in stderr
     finally:
         up = subprocess.run(
