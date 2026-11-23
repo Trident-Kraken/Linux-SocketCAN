@@ -2,7 +2,7 @@
 
 从零实现 ISO 15765-2 (ISO-TP) + ISO 14229 (UDS) 车载诊断协议栈，基于 C11 + Linux SocketCAN 构建，包含协议状态机、诊断服务、自动化测试体系，零第三方协议库依赖。
 
-[![CI](https://github.com/lingfeng-pang/Linux-SocketCAN/actions/workflows/ci.yml/badge.svg)](https://github.com/lingfeng-pang/Linux-SocketCAN/actions/workflows/ci.yml)
+[![CI](https://github.com/Trident-Kraken/Linux-SocketCAN/actions/workflows/ci.yml/badge.svg)](https://github.com/Trident-Kraken/Linux-SocketCAN/actions/workflows/ci.yml)
 
 形态为 **C 语言虚拟 ECU(Server)+ Python 自动化诊断仪(Tester)**，经 `vcan0` 虚拟总线通信，全程无需真实硬件。
 

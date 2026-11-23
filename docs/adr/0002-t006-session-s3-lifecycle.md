@@ -2,7 +2,7 @@
 
 - 状态：已接受
 - 日期：2026-08-02
-- 决策者：lingfeng-pang
+- 决策者：Trident-Kraken
 
 ## 背景
 
