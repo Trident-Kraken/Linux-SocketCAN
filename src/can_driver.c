@@ -75,7 +75,7 @@ int can_open(can_driver_t *driver, const char *ifname, uint32_t rx_id,
         return -ENAMETOOLONG;
     }
 
-    fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    fd = socket(PF_CAN, SOCK_RAW | SOCK_CLOEXEC, CAN_RAW);
     if (fd < 0) {
         return -errno;
     }
@@ -95,8 +95,9 @@ int can_open(can_driver_t *driver, const char *ifname, uint32_t rx_id,
         return result;
     }
 
+    /* Match only 11-bit standard data frames; reject EFF and RTR in kernel. */
     filter.can_id = rx_id;
-    filter.can_mask = CAN_SFF_MASK;
+    filter.can_mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG;
     if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, &filter,
                    sizeof(filter)) < 0) {
         result = -errno;
