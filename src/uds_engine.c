@@ -113,6 +113,7 @@ static bool uds_security_lock_active(uds_ctx_t *ctx)
 /*
  * SecurityAccess state transitions:
  * LOCKED --27 01--> SEED_SENT --correct key--> UNLOCKED
+ * UNLOCKED --27 01--> UNLOCKED (zero seed 0x00000000)
  * SEED_SENT --wrong key (1/2)--> SEED_SENT
  * SEED_SENT --wrong key (3)--> LOCKED + lockout deadline
  * session switch / S3 expiry --> LOCKED + invalidate seed
@@ -278,6 +279,18 @@ uds_result_t uds_security_request_seed(uds_ctx_t *ctx,
     }
     if (uds_security_lock_active(ctx)) {
         return UDS_ERROR_DELAY_NOT_EXPIRED;
+    }
+    /* ISO 14229-1: return zero seed when already unlocked and remain unlocked. */
+    if (ctx->security_state == UDS_SECURITY_UNLOCKED) {
+        response->data[0] = UDS_SID_SECURITY_ACCESS +
+                            UDS_POSITIVE_RESPONSE_OFFSET;
+        response->data[1] = 0x01u;
+        response->data[2] = 0x00u;
+        response->data[3] = 0x00u;
+        response->data[4] = 0x00u;
+        response->data[5] = 0x00u;
+        response->len = 6u;
+        return UDS_RESULT_OK;
     }
     result = uds_generate_seed(&seed);
     if (result < 0) {
