@@ -53,6 +53,8 @@ jobs:
           cmake --build build --parallel
 
       - name: Run pytest
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           .venv/bin/python -m pytest tests/ -v \
             --ecu-binary=build/vuds_ecu \
