@@ -1,6 +1,8 @@
 """Fault-injection and lifecycle regression tests for the virtual ECU."""
 
+import os
 import re
+import select
 import shutil
 import subprocess
 import time
@@ -181,7 +183,31 @@ def test_interface_down_exits_cleanly_and_allows_restart(
         text=True,
     )
     try:
-        time.sleep(0.1)
+        deadline = time.monotonic() + 5.0
+        fd = restarted.stderr.fileno()
+        captured = bytearray()
+        line_start = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, (
+                "restarted ECU did not become ready: "
+                + captured.decode("utf-8", errors="replace").strip()
+            )
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(fd, 1)
+            assert chunk, (
+                "restarted ECU exited during startup: "
+                + captured.decode("utf-8", errors="replace").strip()
+            )
+            captured.extend(chunk)
+            if chunk == b"\n":
+                line = captured[line_start:].decode("utf-8", errors="replace")
+                if "ECU started on " in line:
+                    break
+                line_start = len(captured)
+
         assert restarted.poll() is None
         with UdsClient(vcan_interface) as client:
             assert client.request(bytes.fromhex("10 01")) == bytes.fromhex(

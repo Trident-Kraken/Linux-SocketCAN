@@ -2,8 +2,10 @@
 
 from pathlib import Path
 import os
+import select
 import socket
 import subprocess
+import time
 
 import pytest
 
@@ -64,6 +66,40 @@ def vcan_interface(pytestconfig):
     return interface
 
 
+def _wait_for_ecu_ready(process, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    fd = process.stderr.fileno()
+    captured = bytearray()
+    line_start = 0
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            output = captured.decode("utf-8", errors="replace").strip()
+            pytest.fail(
+                f"ECU did not become ready within {timeout:.1f}s: {output}"
+            )
+
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            continue
+
+        chunk = os.read(fd, 1)
+        if not chunk:
+            process.wait(timeout=2)
+            output = captured.decode("utf-8", errors="replace").strip()
+            pytest.fail(
+                f"ECU exited during startup with {process.returncode}: {output}"
+            )
+
+        captured.extend(chunk)
+        if chunk == b"\n":
+            line = captured[line_start:].decode("utf-8", errors="replace")
+            if "ECU started on " in line:
+                return
+            line_start = len(captured)
+
+
 @pytest.fixture
 def ecu_process(ecu_binary, vcan_interface):
     process = subprocess.Popen(
@@ -73,16 +109,7 @@ def ecu_process(ecu_binary, vcan_interface):
         text=True,
     )
     try:
-        try:
-            process.wait(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            pass
-        else:
-            _, stderr = process.communicate()
-            pytest.fail(
-                f"ECU exited during startup with {process.returncode}: "
-                f"{stderr.strip()}"
-            )
+        _wait_for_ecu_ready(process)
         yield process
     finally:
         if process.poll() is None:
