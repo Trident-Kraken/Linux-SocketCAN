@@ -84,4 +84,4 @@ CI（GitHub Actions `ubuntu-latest`）：
 ## 复审修复更新（2026-11-24）
 
 - 补充 SocketCAN 内核 `EFF/RTR` 过滤掩码与 `SOCK_CLOEXEC`、`0x27` 已解锁状态全 0 Seed 响应、CMake 默认 `Release` 构建类型与不可恢复 UBSan（`-fno-sanitize-recover=all`）。
-- 补全端到端集成用例后，测试集共收集 68 条用例；无 `vcan0` 环境下 C harness 与无总线单元测试 `21 passed, 47 skipped`（Release 与 Debug ASan/UBSan 均通过）。
+- 补全端到端集成用例后，测试集共收集 68 条用例：`vcan0` 特权环境 Release 回归 `68 passed`（含 FT-01）；Debug（ASan/UBSan + `-fno-sanitize-recover=all`）非特权 `vcan0` 回归 `67 passed, 1 skipped in 40.00s`（仅 FT-01 因无 `CAP_NET_ADMIN` 跳过），零 Sanitizer 报错。

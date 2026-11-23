@@ -2,10 +2,10 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v1.10 |
-| 日期 | 2026-08-23 |
-| 状态 | 已评审（T004 RX + T005 TX + T006 会话/S3 + T007 SecurityAccess + T008 DID + T009 DTC + T010 验证基线） |
-| 修订 | v1.10：新增第 6 节与 ISO 标准的已知偏差与限制对照 |
+| 版本 | v1.11 |
+| 日期 | 2026-11-24 |
+| 状态 | 已评审（T004 RX + T005 TX + T006 会话/S3 + T007 SecurityAccess + T008 DID + T009 DTC + T010 验证基线 + 复审修复） |
+| 修订 | v1.11：0x27 已解锁返全 0 Seed、对齐 3.2/3.8 节 0x2E 校验顺序、补齐第 6 节已知偏差 |
 | 关联文档 | [需求规格](requirements.md)、[系统架构](architecture.md)、[AGENTS.md](../../AGENTS.md) |
 | 变更规则 | 见[需求规格第 7 节](requirements.md#7-文档变更规则) |
 
@@ -297,7 +297,7 @@ busy 门禁通过后，分发器按以下固定顺序检查。结构长度检查
 4. 检查当前会话；不允许返回 `serviceNotSupportedInSession`。
 5. 调用只读 validator 检查 Sub-function 和服务相关精确长度；失败返回对应内部结果。
 6. 检查安全权限；未解锁返回 `securityDenied`。
-7. 调用 handler 执行业务语义；DID 存在性、SecurityAccess 顺序和 Key 等结果由 handler 返回。
+7. 调用 handler 执行业务语义；`0x22` 的 DID 存在性由 handler 返回，`0x2E` 的 DID 存在性、可写性与精确长度先由只读 validator 校验（与第 3.8 节一致）；SecurityAccess 顺序和 Key 等结果由 handler 返回。
 
 在扩展会话中，通过第 5 步的请求定义为“有效诊断请求”：进入第 6 步前重置 S3。因此安全拒绝或 handler 返回业务 NRC 的有效请求仍续期 S3；未知 SID、结构/格式错误和 busy 门禁拦截的请求不续期。suppress positive 不影响 S3 续期。
 
@@ -465,7 +465,7 @@ T008 实现使用静态 DID 表保存五项数据；0xF190 VIN 和 0x0200 采样
 状态机：
 
 ```text
-LOCKED --27 01--> SEED_SENT --correct key--> UNLOCKED
+LOCKED --27 01--> SEED_SENT --correct key--> UNLOCKED --27 01--> UNLOCKED (0x00000000)
    ^                  |  ^                     |
    |                  |  +--wrong key (1/2)---+
    |                  +--wrong key (3)--> LOCKED + lock_until(10 s)
@@ -473,19 +473,19 @@ LOCKED --27 01--> SEED_SENT --correct key--> UNLOCKED
    +---------------- requestSeed after expiry ----+
 
 session switch / S3 expiry --> LOCKED + invalidate seed
-new requestSeed             --> SEED_SENT + replace seed
+new requestSeed (not unlocked) --> SEED_SENT + replace seed
 ```
 
 | 项 | 规格 |
 |---|---|
-| 请求 Seed | `27 01` → `67 01 [4 字节随机 Seed]` |
+| 请求 Seed | `27 01` → 未解锁时 `67 01 [4 字节随机 Seed]`；已解锁时 `67 01 00 00 00 00` 并保持解锁 |
 | 发送 Key | `27 02 [4 字节 Key]` → 正确 `67 02`；错误 `7F 27 35` |
 | 顺序错误 | 未先请求 Seed 直接 `27 02` → `7F 27 24` |
-| Seed 生成 | `/dev/urandom` 取 4 字节，不全为 0x00/0xFF；每次 requestSeed 重新生成并覆盖旧 seed |
+| Seed 生成 | `/dev/urandom` 取 4 字节，不全为 0x00/0xFF；未解锁时每次 requestSeed 重新生成并覆盖旧 seed |
 | Seed 生命周期 | 解锁成功 / 会话切换 / 新的 requestSeed 时失效 |
 | 失败锁定 | 连续 3 次 Key 错误 → 本次返回 `7F 27 36`，锁定 10 秒（`CLOCK_MONOTONIC` 惰性判断）；锁定期间 requestSeed 返回 `7F 27 37`；期满后首个 requestSeed 清零失败计数 |
 
-失败计数在成功解锁或锁定期满后的首个 `requestSeed` 时清零；会话切换和 S3 到期只使当前 seed/解锁态失效，不得通过切换会话绕过尚未到期的锁定截止时间。`requestSeed` 每次都覆盖旧 seed，seed/key 均按大端在线序编码。
+失败计数在成功解锁或锁定期满后的首个 `requestSeed` 时清零；会话切换和 S3 到期只使当前 seed/解锁态失效，不得通过切换会话绕过尚未到期的锁定截止时间。已解锁状态下再次收到 `27 01` 按 ISO 14229-1 返回全 0 Seed（`67 01 00 00 00 00`）并保持 `UNLOCKED` 且不产生待验证 seed；未解锁时 `requestSeed` 每次都覆盖旧 seed，seed/key 均按大端在线序编码。
 
 ```c
 uint32_t uds_compute_key(uint32_t seed) {
@@ -649,6 +649,19 @@ ECU → Tester : 7E8# 03 7F 2E 7F AA AA AA AA      (NRC 0x7F: 当前会话不支
    语义与"仅 SEED_SENT 状态允许 sendKey"自洽，锁定期内 `27 01` 仍正确返回
    0x37，锁定语义不受影响。
 
-6. **STmin 保留值解释为 127ms（ISO 15765-2）**：STmin 0x80-0xF0 为标准保留
-   值，本项目统一按 127ms（最大合法毫秒值）处理（第 2.1、2.8 节）。标准未
-   定义该区间行为，常见实现取 0 或 127ms，本项目取后者以保持发送节奏保守。
+6. **STmin 保留值解释为 127ms（ISO 15765-2）**：STmin `0x80-0xF0` 与
+   `0xFA-0xFF` 为标准保留值，本项目统一按 127ms（最大合法毫秒值）处理
+   （第 2.1、2.8 节）。标准未定义该区间行为，常见实现取 0 或 127ms，本项目
+   取后者以保持发送节奏保守。
+
+7. **0x27 错误 Key 后保留当前 Seed 有效（ISO 14229-1）**：第 1/2 次 Key 错误
+   返回 NRC `0x35` 后，状态机停留在 `SEED_SENT` 且不作废当前 Seed，诊断仪可
+   直接重发 `27 02`（第 3.9 节）。ISO 14229-1 常见实现要求错误 Key 后使旧
+   Seed 失效并重新 `27 01` 获取挑战。本项目允许单挑战重试，同时在第 3 次错
+   误时立即清零 Seed 并进入 10 秒锁定（`0x36`），防爆破语义不受影响。
+
+8. **0x19 / 0x27 不支持肯定响应抑制位（ISO 14229-1）**：仅 `0x10` 与 `0x3E`
+   开启 `supports_suppress`，`0x19` 与 `0x27` 虽然带有 Sub-function 字节，但
+   收到置位 bit7 的子功能（如 `19 82`、`27 81`）时按未支持子功能返回 NRC
+   `0x12`（第 3.2 节）。标准中带 Sub-function 的服务原则上均可带抑制位，
+   本项目将其收窄为必做服务 `0x10`/`0x3E`。

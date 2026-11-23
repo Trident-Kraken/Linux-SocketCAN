@@ -11,8 +11,8 @@
 - **ISO-TP 传输层**：SF/FF/CF/FC 双向收发状态机、SN 校验(F→0 回绕)、BS/STmin 流控(含 0xF1-0xF9 微秒档)、N_Bs/N_Cr 超时管理，4095 字节协议上限双向覆盖
 - **UDS 应用层**：0x10 会话控制(含 S3 5s 超时自动降级)、0x3E TesterPresent(含肯定响应抑制)、0x22/0x2E DID 读写、0x27 Seed-Key 安全访问(3 次失败锁定 10 秒)、0x19 DTC 状态掩码查询
 - **运行时设计**：单线程 epoll 事件循环，CAN socket 与全部 timerfd 统一 fd 化派发；数据路径零 malloc/free,缓冲区静态预分配；C 侧除 libc 与内核头文件外零依赖
-- **验证体系**：pytest 63 条用例，以 python-can + can-isotp 参考实现与本协议栈交叉验证；Debug 构建 ASan/UBSan 全绿；Valgrind 10 分钟 163 万请求 0 错误 0 泄漏
-- **文档**：需求/架构/设计三层规格文档、任务级开发记录、五类 Wireshark 抓包证据、与 ISO 标准的已知偏差清单
+- **验证体系**：pytest 68 条用例，以 python-can + can-isotp 参考实现与本协议栈交叉验证；Debug 构建 ASan/UBSan 全绿；Valgrind 10 分钟 163 万请求 0 错误 0 泄漏
+- **文档**：需求/架构/设计三层规格文档、架构决策记录（ADR）、五类 Wireshark 抓包证据、与 ISO 标准的已知偏差清单
 
 ## 架构
 
@@ -49,15 +49,15 @@ cmake -S . -B build && cmake --build build --parallel
 ```console
 $ candump -tz vcan0 &                        # 观察总线
 
-$ cansend vcan0 7E0#021001AAAAAAAAAAAA       # 10 01 切默认会话
+$ cansend vcan0 7E0#021001AAAAAAAAAA       # 10 01 切默认会话
   vcan0  7E8   [8]  06 50 01 00 32 01 F4 AA
 
-$ cansend vcan0 7E0#03220100AAAAAAAAAAAA      # 22 01 00 读冷却温度 DID
+$ cansend vcan0 7E0#03220100AAAAAAAA      # 22 01 00 读冷却温度 DID
   vcan0  7E8   [8]  05 62 01 00 00 55 AA AA
 
-$ cansend vcan0 7E0#0322F190AAAAAAAAAAAA      # 22 F1 90 读 VIN → 多帧响应
+$ cansend vcan0 7E0#0322F190AAAAAAAA      # 22 F1 90 读 VIN → 多帧响应
   vcan0  7E8   [8]  10 14 62 F1 90 4C 56 55   # FF：总长 0x14=20 字节
-$ cansend vcan0 7E0#300000AAAAAAAAAAAA        # 手动发 FC(CTS, BS=0, STmin=0)
+$ cansend vcan0 7E0#300000AAAAAAAAAA        # 手动发 FC(CTS, BS=0, STmin=0)
   vcan0  7E8   [8]  21 44 53 32 30 32 36 44   # CF
   vcan0  7E8   [8]  22 45 4D 4F 30 30 30 31   # CF → "LVUDS2026DEMO0001"
 ```
@@ -84,7 +84,7 @@ $ cansend vcan0 7E0#300000AAAAAAAAAAAA        # 手动发 FC(CTS, BS=0, STmin=0)
   --ecu-binary=build/vuds_ecu --isotp-harness=build/isotp_rx_harness
 ```
 
-- **pytest 63 条**：正常/异常流程、ISO-TP 边界(7 字节 SF、8 字节 FF、4095 上限、SN 错乱、双超时)、0x27 全锁定生命周期、vcan down/restart 故障注入。Tester 侧以 can-isotp 作为参考实现交叉验证；无 vcan0 的环境下集成用例自动 skip,协议 harness 用例照常运行
+- **pytest 68 条**：正常/异常流程、ISO-TP 边界(7 字节 SF、8 字节 FF、4095 上限、SN 错乱、双超时)、0x27 全锁定生命周期、vcan down/restart 故障注入。Tester 侧以 can-isotp 作为参考实现交叉验证；无 vcan0 的环境下集成用例自动 skip,协议 harness 用例照常运行
 - **接口 down/restart 用例**需要 `CAP_NET_ADMIN`:
 
   ```bash
@@ -126,5 +126,5 @@ docs/                 技术规格、任务记录、验证记录与抓包证据
 ## 文档索引
 
 - [需求规格](docs/spec/requirements.md) · [系统架构](docs/spec/architecture.md) · [详细设计](docs/spec/design.md)(含[已知偏差与限制](docs/spec/design.md#6-已知偏差与限制与-iso-标准对照))
-- [验证记录](docs/verification.md) · [开发路线与任务记录](docs/roadmap.md)
-- [`AGENTS.md`](AGENTS.md):工程规范(范围红线、协议事实基准、测试要求、提交规范)
+- [验证记录](docs/verification.md) · [开发路线图](docs/roadmap.md)
+- [`AGENTS.md`](AGENTS.md)：工程规范（范围约束、分层红线、协议事实基准、测试与提交规范）
