@@ -342,12 +342,14 @@ static int isotp_handle_first_frame(isotp_ctx_t *ctx,
     uint16_t total_len = (uint16_t)(((frame->data[0] &
                                       ISOTP_FF_LEN_HIGH_MASK) << 8) |
                                     frame->data[1]);
+    bool was_waiting_cf;
     int result;
 
     if (total_len < 8u || total_len > ISOTP_MAX_LEN) {
         return 0;
     }
 
+    was_waiting_cf = (ctx->rx_state == ISOTP_RX_WAIT_CF);
     isotp_reset_rx(ctx);
     (void)memcpy(ctx->rx_buffer, &frame->data[2], 6u);
     ctx->rx_len = 6u;
@@ -358,13 +360,22 @@ static int isotp_handle_first_frame(isotp_ctx_t *ctx,
     result = isotp_send_flow_control(ctx);
     if (result < 0) {
         isotp_reset_rx(ctx);
+        if (was_waiting_cf && ctx->config.on_rx_abort != NULL) {
+            ctx->config.on_rx_abort(ctx->config.user);
+        }
         return result;
     }
     result = isotp_arm_timer_us(ctx, ISOTP_TIMER_N_CR,
                                 ISOTP_N_CR_MS * 1000u);
     if (result < 0) {
         isotp_reset_rx(ctx);
+        if (was_waiting_cf && ctx->config.on_rx_abort != NULL) {
+            ctx->config.on_rx_abort(ctx->config.user);
+        }
         return result;
+    }
+    if (ctx->config.on_first_frame != NULL) {
+        ctx->config.on_first_frame(ctx->config.user);
     }
     return 0;
 }
@@ -388,6 +399,9 @@ static int isotp_handle_consecutive_frame(isotp_ctx_t *ctx,
     if (sequence_number != ctx->rx_expected_sn) {
         ctx->stats.sn_errors++;
         isotp_reset_rx(ctx);
+        if (ctx->config.on_rx_abort != NULL) {
+            ctx->config.on_rx_abort(ctx->config.user);
+        }
         return 0;
     }
 
@@ -403,6 +417,9 @@ static int isotp_handle_consecutive_frame(isotp_ctx_t *ctx,
                                 ISOTP_N_CR_MS * 1000u);
     if (result < 0) {
         isotp_reset_rx(ctx);
+        if (ctx->config.on_rx_abort != NULL) {
+            ctx->config.on_rx_abort(ctx->config.user);
+        }
         return result;
     }
     return 0;
@@ -416,7 +433,8 @@ int isotp_init(isotp_ctx_t *ctx, const isotp_config_t *config)
         config->frame_sender.send == NULL ||
         config->on_message == NULL || config->on_tx_done == NULL ||
         config->rx_id > CAN_STANDARD_ID_MAX ||
-        config->tx_id > CAN_STANDARD_ID_MAX) {
+        config->tx_id > CAN_STANDARD_ID_MAX ||
+        config->rx_id == config->tx_id) {
         return -EINVAL;
     }
     if (ctx->initialized) {
@@ -585,6 +603,9 @@ int isotp_on_timer(isotp_ctx_t *ctx, isotp_timer_t timer)
     if (timer == ISOTP_TIMER_N_CR && ctx->rx_state == ISOTP_RX_WAIT_CF) {
         ctx->stats.timeouts++;
         isotp_reset_rx(ctx);
+        if (ctx->config.on_rx_abort != NULL) {
+            ctx->config.on_rx_abort(ctx->config.user);
+        }
     } else if (timer == ISOTP_TIMER_N_BS &&
                ctx->tx_state == ISOTP_TX_WAIT_FC) {
         ctx->stats.timeouts++;
