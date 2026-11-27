@@ -62,6 +62,7 @@ int can_open(can_driver_t *driver, const char *ifname, uint32_t rx_id,
     struct ifreq interface_request;
     struct sockaddr_can address;
     int fd;
+    int ifindex;
     int result;
 
     if (driver == NULL || ifname == NULL || ifname[0] == '\0' ||
@@ -94,6 +95,17 @@ int can_open(can_driver_t *driver, const char *ifname, uint32_t rx_id,
         (void)close(fd);
         return result;
     }
+    ifindex = interface_request.ifr_ifindex;
+
+    if (ioctl(fd, SIOCGIFFLAGS, &interface_request) < 0) {
+        result = -errno;
+        (void)close(fd);
+        return result;
+    }
+    if (((unsigned int)interface_request.ifr_flags & (unsigned int)IFF_UP) == 0u) {
+        (void)close(fd);
+        return -ENETDOWN;
+    }
 
     /* Match only 11-bit standard data frames; reject EFF and RTR in kernel. */
     filter.can_id = rx_id;
@@ -107,7 +119,7 @@ int can_open(can_driver_t *driver, const char *ifname, uint32_t rx_id,
 
     (void)memset(&address, 0, sizeof(address));
     address.can_family = AF_CAN;
-    address.can_ifindex = interface_request.ifr_ifindex;
+    address.can_ifindex = ifindex;
     if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         result = -errno;
         (void)close(fd);
@@ -205,7 +217,9 @@ int can_send(can_driver_t *driver, const can_frame_t *frame)
     (void)memset(&kernel_frame, 0, sizeof(kernel_frame));
     kernel_frame.can_id = frame->id;
     kernel_frame.can_dlc = frame->dlc;
-    (void)memcpy(kernel_frame.data, frame->data, CAN_CLASSIC_DLEN);
+    if (frame->dlc > 0u) {
+        (void)memcpy(kernel_frame.data, frame->data, frame->dlc);
+    }
 
     do {
         sent = send(driver->fd, &kernel_frame, sizeof(kernel_frame),
