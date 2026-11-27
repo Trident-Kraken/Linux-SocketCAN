@@ -659,6 +659,8 @@ static bool init_uds_context(isotp_ctx_t *isotp, uds_ctx_t *uds)
     config.tx_id = TEST_TX_ID;
     config.on_message = uds_on_isotp_message;
     config.on_tx_done = uds_on_isotp_tx_done;
+    config.on_first_frame = uds_on_isotp_first_frame;
+    config.on_rx_abort = uds_on_isotp_rx_abort;
     config.user = uds;
     result = isotp_init(isotp, &config);
     if (result < 0) {
@@ -1586,6 +1588,151 @@ static bool scenario_strict(void)
     return result;
 }
 
+static bool scenario_uds_multiframe_s3_and_stats(void)
+{
+    isotp_ctx_t isotp = {0};
+    uds_ctx_t uds = {0};
+    const uint8_t enter_extended[] = {UDS_SID_DIAGNOSTIC_SESSION_CONTROL,
+                                      0x03u};
+    const uint8_t unknown_service[] = {0x99u};
+    const uint8_t read_vin[] = {UDS_SID_READ_DATA_BY_IDENTIFIER,
+                                0xF1u, 0x90u};
+    const uint8_t request_seed[] = {UDS_SID_SECURITY_ACCESS, 0x01u};
+    uint8_t key_request[6] = {UDS_SID_SECURITY_ACCESS, 0x02u,
+                              0u, 0u, 0u, 0u};
+    uint8_t write_vin[20] = {UDS_SID_WRITE_DATA_BY_IDENTIFIER,
+                             0xF1u, 0x90u};
+    const uint8_t vin[] = "LVUDS2026TEST0003";
+    const uds_stats_t *stats;
+    struct itimerspec timer_after = {0};
+    uint32_t seed;
+    size_t base_frames;
+    bool result = true;
+
+    (void)memcpy(&write_vin[3], vin, sizeof(vin) - 1u);
+
+    reset_capture();
+    result = check(init_uds_context(&isotp, &uds),
+                   "multi-frame S3/stats context initializes") && result;
+    forced_send_status = -EIO;
+    result = send_sf(&isotp, enter_extended, sizeof(enter_extended)) && result;
+    result = send_sf(&isotp, unknown_service, sizeof(unknown_service)) &&
+             result;
+    stats = uds_get_stats(&uds);
+    result = check(stats != NULL && stats->requests == 2u &&
+                       stats->positive_responses == 0u &&
+                       stats->negative_responses == 0u,
+                   "failed SF sends do not increment response stats") &&
+             result;
+
+    forced_send_status = 0;
+    reset_capture();
+    result = send_sf(&isotp, read_vin, sizeof(read_vin)) && result;
+    result = send_fc(&isotp, 2u, 0u, 0u) && result;
+    stats = uds_get_stats(&uds);
+    result = check(stats != NULL && stats->positive_responses == 0u,
+                   "aborted multi-frame TX does not increment positive stats") &&
+             result;
+
+    reset_capture();
+    result = send_sf(&isotp, read_vin, sizeof(read_vin)) && result;
+    base_frames = sent_frame_count;
+    result = send_fc(&isotp, 0u, 0u, 0u) && result;
+    result = drive_stmin_timer(&isotp, base_frames + 2u) && result;
+    stats = uds_get_stats(&uds);
+    result = check(stats != NULL && stats->positive_responses == 1u,
+                   "completed multi-frame TX increments positive stats once") &&
+             result;
+    uds_deinit(&uds);
+    isotp_deinit(&isotp);
+
+    reset_capture();
+    result = check(init_uds_context(&isotp, &uds),
+                   "multi-frame RX S3 context initializes") && result;
+    result = send_sf(&isotp, enter_extended, sizeof(enter_extended)) && result;
+    reset_capture();
+    result = send_sf(&isotp, request_seed, sizeof(request_seed)) && result;
+    seed = ((uint32_t)sent_frames[0].data[3] << 24u) |
+           ((uint32_t)sent_frames[0].data[4] << 16u) |
+           ((uint32_t)sent_frames[0].data[5] << 8u) |
+           (uint32_t)sent_frames[0].data[6];
+    key_request[2] = (uint8_t)(uds_compute_key(seed) >> 24u);
+    key_request[3] = (uint8_t)(uds_compute_key(seed) >> 16u);
+    key_request[4] = (uint8_t)(uds_compute_key(seed) >> 8u);
+    key_request[5] = (uint8_t)uds_compute_key(seed);
+    reset_capture();
+    result = send_sf(&isotp, key_request, sizeof(key_request)) && result;
+    result = check(set_uds_s3_timer_ms(&uds, 40u),
+                   "shortens S3 for multi-frame RX pause check") && result;
+    reset_capture();
+    result = send_ff(&isotp, sizeof(write_vin), write_vin) && check_fc() &&
+             result;
+    result = check(!uds_s3_timer_active(&uds) && uds.s3_paused_for_rx,
+                   "multi-frame FF pauses active S3 timer") && result;
+    result = sleep_milliseconds(60L) && result;
+    result = check(uds_on_s3_timer(&uds) == 0 &&
+                       uds.session == UDS_SESSION_EXTENDED,
+                   "slow multi-frame RX does not expire S3") && result;
+    result = send_cf(&isotp, 1u, &write_vin[6], 7u) && result;
+    result = send_cf(&isotp, 2u, &write_vin[13], 7u) && result;
+    result = check(sent_frame_count == 2u &&
+                       check_tx_frame(&sent_frames[1], 0x03u,
+                                      (const uint8_t[]){0x6Eu, 0xF1u, 0x90u},
+                                      3u) &&
+                       uds_s3_timer_active(&uds) &&
+                       timerfd_gettime(uds_s3_timer_fd(&uds),
+                                       &timer_after) == 0 &&
+                       timer_after.it_value.tv_sec >= 4,
+                   "completed multi-frame RX writes VIN and restarts S3") &&
+             result;
+
+    result = check(set_uds_s3_timer_ms(&uds, 30u),
+                   "shortens S3 for multi-frame RX abort restore check") &&
+             result;
+    reset_capture();
+    result = send_ff(&isotp, sizeof(write_vin), write_vin) && result;
+    result = check(uds.s3_paused_for_rx,
+                   "second FF pauses S3 before abort") && result;
+    result = send_cf(&isotp, 2u, &write_vin[6], 7u) && result;
+    result = check(!uds.s3_paused_for_rx && uds_s3_timer_active(&uds),
+                   "SN abort restores remaining S3 timer") && result;
+    result = sleep_milliseconds(45L) && result;
+    result = check(uds_on_s3_timer(&uds) == 0 &&
+                       uds.session == UDS_SESSION_DEFAULT &&
+                       !uds_s3_timer_active(&uds),
+                   "restored S3 expires without granting a free extension") &&
+             result;
+    uds_deinit(&uds);
+    isotp_deinit(&isotp);
+
+    reset_capture();
+    result = check(init_uds_context(&isotp, &uds),
+                   "multi-frame TX S3 context initializes") && result;
+    result = send_sf(&isotp, enter_extended, sizeof(enter_extended)) && result;
+    result = check(set_uds_s3_timer_ms(&uds, 40u),
+                   "shortens S3 for multi-frame TX pause check") && result;
+    reset_capture();
+    result = send_sf(&isotp, read_vin, sizeof(read_vin)) && result;
+    result = check(!uds_s3_timer_active(&uds) && uds.s3_paused_for_tx,
+                   "multi-frame TX pauses active S3 timer") && result;
+    result = sleep_milliseconds(60L) && result;
+    result = check(uds_on_s3_timer(&uds) == 0 &&
+                       uds.session == UDS_SESSION_EXTENDED,
+                   "slow multi-frame TX does not expire S3") && result;
+    base_frames = sent_frame_count;
+    result = send_fc(&isotp, 0u, 0u, 0u) && result;
+    result = drive_stmin_timer(&isotp, base_frames + 2u) && result;
+    result = check(!uds.s3_paused_for_tx && uds_s3_timer_active(&uds) &&
+                       timerfd_gettime(uds_s3_timer_fd(&uds),
+                                       &timer_after) == 0 &&
+                       timer_after.it_value.tv_sec >= 4,
+                   "completed multi-frame TX restarts S3") && result;
+
+    uds_deinit(&uds);
+    isotp_deinit(&isotp);
+    return result;
+}
+
 static bool scenario_lifecycle(void)
 {
     isotp_ctx_t isotp = {0};
@@ -1618,6 +1765,11 @@ static bool scenario_lifecycle(void)
         invalid_config.frame_sender.context = NULL;
         result = check(isotp_init(&isotp, &invalid_config) == -EINVAL,
                        "ISO-TP rejects a CAN frame sender without context") &&
+                 result;
+        invalid_config = config;
+        invalid_config.tx_id = invalid_config.rx_id;
+        result = check(isotp_init(&isotp, &invalid_config) == -EINVAL,
+                       "ISO-TP rejects identical rx_id and tx_id") &&
                  result;
     }
     open_fds = count_open_fds();
@@ -1699,7 +1851,7 @@ int main(int argc, char **argv)
         (void)fprintf(stderr,
                       "usage: %s basic|tx-basic|tx-boundary|tx-flow|"
                       "tx-stmin|tx-abort|tx-wait|uds-busy|uds-session-s3|"
-                      "uds-security|uds-did|uds-dtc|"
+                      "uds-security|uds-did|uds-dtc|uds-multiframe-s3|"
                       "boundary|sn-error|"
                       "tx-can-error|tx-cleanup-error|timeout|"
                       "preempt|strict|lifecycle\n",
@@ -1747,6 +1899,10 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "uds-dtc") == 0) {
         return scenario_uds_dtc() ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (strcmp(argv[1], "uds-multiframe-s3") == 0) {
+        return scenario_uds_multiframe_s3_and_stats() ? EXIT_SUCCESS
+                                                      : EXIT_FAILURE;
     }
     if (strcmp(argv[1], "boundary") == 0) {
         return scenario_boundary() ? EXIT_SUCCESS : EXIT_FAILURE;

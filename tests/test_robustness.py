@@ -167,6 +167,15 @@ def test_interface_down_exits_cleanly_and_allows_restart(
         _, stderr = ecu_process.communicate()
         assert ecu_process.returncode == 1
         assert "event handling failed" in stderr
+
+        down_start = subprocess.run(
+            [str(ecu_binary), "-i", vcan_interface],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert down_start.returncode == 1
+        assert "Network is down" in down_start.stderr
     finally:
         up = subprocess.run(
             ["ip", "link", "set", "dev", vcan_interface, "up"],
@@ -218,3 +227,21 @@ def test_interface_down_exits_cleanly_and_allows_restart(
             restarted.terminate()
             restarted.wait(timeout=2)
         restarted.communicate()
+
+
+def test_cli_rejects_invalid_arguments(ecu_binary):
+    invalid_invocations = (
+        ["can0"],
+        ["-r", "0x7E0", "-t", "0x7E0"],
+        ["-r", "-0"],
+        ["-r", " 0x7E0"],
+    )
+
+    for args in invalid_invocations:
+        completed = subprocess.run(
+            [str(ecu_binary), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode != 0, args

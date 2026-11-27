@@ -130,6 +130,10 @@ def test_dtc_harness(isotp_harness):
     run_harness(isotp_harness, "uds-dtc")
 
 
+def test_multiframe_s3_and_response_stats_harness(isotp_harness):
+    run_harness(isotp_harness, "uds-multiframe-s3")
+
+
 def test_read_dtc_reports_all_records(ecu_process, vcan_interface):
     bus, stack = start_isotp_stack(vcan_interface)
     try:
