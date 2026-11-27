@@ -20,7 +20,7 @@ uds_result_t uds_handle_diagnostic_session_control(
     uds_response_t *response)
 {
     if (ctx == NULL || request == NULL || response == NULL ||
-        response->capacity < 6u) {
+        response->data == NULL || response->capacity < 6u) {
         return UDS_ERROR_GENERAL_REJECT;
     }
 
@@ -51,7 +51,7 @@ uds_result_t uds_handle_tester_present(
     uds_response_t *response)
 {
     if (ctx == NULL || request == NULL || response == NULL ||
-        response->capacity < 2u) {
+        response->data == NULL || response->capacity < 2u) {
         return UDS_ERROR_GENERAL_REJECT;
     }
 
@@ -84,7 +84,7 @@ uds_result_t uds_validate_write_data_by_identifier(
         return UDS_ERROR_INVALID_FORMAT;
     }
     did = ((uint16_t)request->data[1] << 8u) | request->data[2];
-    return uds_data_validate_write(did, request->len - 3u);
+    return uds_data_validate_write(did, (uint16_t)(request->len - 3u));
 }
 
 uds_result_t uds_handle_security_access(
@@ -130,7 +130,7 @@ uds_result_t uds_handle_read_dtc_information(
     response->data[1] = UDS_DTC_REPORT_BY_STATUS_MASK;
     response->data[2] = UDS_DTC_STATUS_AVAILABILITY_MASK;
     result = uds_data_read_dtcs(request->data[2], &response->data[3],
-                                response->capacity - 3u, &dtc_len);
+                                (uint16_t)(response->capacity - 3u), &dtc_len);
     if (result != UDS_RESULT_OK) {
         return result;
     }
@@ -152,7 +152,8 @@ uds_result_t uds_handle_write_data_by_identifier(
     }
 
     did = ((uint16_t)request->data[1] << 8u) | request->data[2];
-    result = uds_data_write_did(did, &request->data[3], request->len - 3u);
+    result = uds_data_write_did(did, &request->data[3],
+                                (uint16_t)(request->len - 3u));
     if (result != UDS_RESULT_OK) {
         return result;
     }
@@ -173,8 +174,9 @@ uds_result_t uds_handle_read_data_by_identifier(
     uint16_t data_len;
     uds_result_t result;
 
-    if (ctx == NULL || request == NULL || response == NULL ||
-        response->capacity < 3u) {
+    if (ctx == NULL || request == NULL || request->data == NULL ||
+        response == NULL || response->data == NULL || response->capacity < 3u ||
+        request->len < 3u) {
         return UDS_ERROR_GENERAL_REJECT;
     }
 
@@ -184,11 +186,11 @@ uds_result_t uds_handle_read_data_by_identifier(
     response->data[1] = request->data[1];
     response->data[2] = request->data[2];
     result = uds_data_read_did(did, &response->data[3],
-                               response->capacity - 3u, &data_len);
+                               (uint16_t)(response->capacity - 3u), &data_len);
     if (result != UDS_RESULT_OK) {
         return result;
     }
 
-    response->len = 3u + data_len;
+    response->len = (uint16_t)(3u + data_len);
     return UDS_RESULT_OK;
 }

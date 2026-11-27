@@ -211,6 +211,13 @@ static int uds_drain_s3_timer(uds_ctx_t *ctx)
     }
 }
 
+static void uds_clear_s3_pause(uds_ctx_t *ctx)
+{
+    ctx->s3_paused_for_rx = false;
+    ctx->s3_paused_for_tx = false;
+    ctx->s3_saved_remaining_ns = 0u;
+}
+
 static int uds_stop_s3_timer(uds_ctx_t *ctx)
 {
     const struct itimerspec disarmed = {0};
@@ -235,7 +242,41 @@ static int uds_start_s3_timer(uds_ctx_t *ctx)
     if (timerfd_settime(ctx->s3_timer_fd, 0, &value, NULL) < 0) {
         return -errno;
     }
+    uds_clear_s3_pause(ctx);
     return 0;
+}
+
+static int uds_arm_s3_ns(uds_ctx_t *ctx, uint64_t remaining_ns)
+{
+    struct itimerspec value = {0};
+    uint64_t clamped = remaining_ns == 0u ? 1u : remaining_ns;
+    int result;
+
+    result = uds_stop_s3_timer(ctx);
+    if (result < 0) {
+        return result;
+    }
+    value.it_value.tv_sec = (time_t)(clamped / 1000000000ULL);
+    value.it_value.tv_nsec = (long)(clamped % 1000000000ULL);
+    if (timerfd_settime(ctx->s3_timer_fd, 0, &value, NULL) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
+static void uds_restore_paused_rx_s3(uds_ctx_t *ctx)
+{
+    uint64_t remaining_ns;
+
+    if (ctx == NULL || !ctx->initialized || !ctx->s3_paused_for_rx) {
+        return;
+    }
+    remaining_ns = ctx->s3_saved_remaining_ns;
+    ctx->s3_paused_for_rx = false;
+    ctx->s3_saved_remaining_ns = 0u;
+    if (ctx->session == UDS_SESSION_EXTENDED && !ctx->s3_paused_for_tx) {
+        (void)uds_arm_s3_ns(ctx, remaining_ns);
+    }
 }
 
 static int uds_refresh_s3(uds_ctx_t *ctx)
@@ -243,6 +284,7 @@ static int uds_refresh_s3(uds_ctx_t *ctx)
     if (ctx->session == UDS_SESSION_EXTENDED) {
         return uds_start_s3_timer(ctx);
     }
+    uds_clear_s3_pause(ctx);
     return uds_stop_s3_timer(ctx);
 }
 
@@ -262,6 +304,7 @@ static int uds_apply_session_control(uds_ctx_t *ctx, uint8_t subfunction)
             return result;
         }
         ctx->session = UDS_SESSION_DEFAULT;
+        uds_clear_s3_pause(ctx);
     }
     uds_security_clear_seed(ctx);
     return 0;
@@ -405,6 +448,32 @@ static uint8_t uds_result_to_nrc(uds_result_t result)
     }
 }
 
+static void uds_send_payload(uds_ctx_t *ctx, const uint8_t *data,
+                             uint16_t len, uds_tx_kind_t kind,
+                             bool pause_s3_for_multiframe)
+{
+    bool paused_s3 = false;
+
+    if (pause_s3_for_multiframe &&
+        ctx->session == UDS_SESSION_EXTENDED &&
+        len > ISOTP_SF_MAX_LEN) {
+        if (uds_stop_s3_timer(ctx) == 0) {
+            ctx->s3_paused_for_tx = true;
+            paused_s3 = true;
+        }
+    }
+    ctx->pending_tx_kind = kind;
+    if (isotp_send(ctx->transport, data, len) < 0) {
+        ctx->pending_tx_kind = UDS_TX_NONE;
+        if (paused_s3) {
+            ctx->s3_paused_for_tx = false;
+            if (ctx->session == UDS_SESSION_EXTENDED) {
+                (void)uds_start_s3_timer(ctx);
+            }
+        }
+    }
+}
+
 static void uds_send_negative_nrc(uds_ctx_t *ctx, uint8_t sid, uint8_t nrc)
 {
     uint8_t response[3] = {
@@ -413,9 +482,7 @@ static void uds_send_negative_nrc(uds_ctx_t *ctx, uint8_t sid, uint8_t nrc)
         nrc,
     };
 
-    if (isotp_send(ctx->transport, response, sizeof(response)) == 0) {
-        ctx->stats.negative_responses++;
-    }
+    uds_send_payload(ctx, response, sizeof(response), UDS_TX_NEGATIVE, false);
 }
 
 static void uds_send_negative(uds_ctx_t *ctx, uint8_t sid,
@@ -463,6 +530,36 @@ void uds_deinit(uds_ctx_t *ctx)
     (void)memset(ctx, 0, sizeof(*ctx));
 }
 
+void uds_on_isotp_first_frame(void *user)
+{
+    uds_ctx_t *ctx = user;
+    struct itimerspec current = {0};
+    uint64_t remaining_ns;
+
+    if (ctx == NULL || !ctx->initialized ||
+        ctx->session != UDS_SESSION_EXTENDED ||
+        ctx->s3_paused_for_rx || ctx->s3_paused_for_tx) {
+        return;
+    }
+    if (timerfd_gettime(ctx->s3_timer_fd, &current) < 0) {
+        return;
+    }
+    if (current.it_value.tv_sec == 0 && current.it_value.tv_nsec == 0) {
+        return;
+    }
+    remaining_ns = (uint64_t)current.it_value.tv_sec * 1000000000ULL +
+                   (uint64_t)current.it_value.tv_nsec;
+    if (uds_stop_s3_timer(ctx) == 0) {
+        ctx->s3_saved_remaining_ns = remaining_ns;
+        ctx->s3_paused_for_rx = true;
+    }
+}
+
+void uds_on_isotp_rx_abort(void *user)
+{
+    uds_restore_paused_rx_s3(user);
+}
+
 void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
 {
     uds_ctx_t *ctx = user;
@@ -471,12 +568,17 @@ void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
     uds_response_t response;
     uds_result_t result;
 
-    if (ctx == NULL || !ctx->initialized || data == NULL || len == 0u) {
+    if (ctx == NULL || !ctx->initialized) {
+        return;
+    }
+    if (data == NULL || len == 0u) {
+        uds_restore_paused_rx_s3(ctx);
         return;
     }
 
     ctx->stats.requests++;
     if (isotp_tx_busy(ctx->transport)) {
+        uds_restore_paused_rx_s3(ctx);
         if (!ctx->busy_sid_valid) {
             ctx->busy_sid = data[0];
             ctx->busy_sid_valid = true;
@@ -486,14 +588,17 @@ void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
 
     service = uds_find_service(data[0]);
     if (service == NULL) {
+        uds_restore_paused_rx_s3(ctx);
         uds_send_negative(ctx, data[0], UDS_ERROR_SERVICE_NOT_SUPPORTED);
         return;
     }
     if (len < service->min_len || len > service->max_len) {
+        uds_restore_paused_rx_s3(ctx);
         uds_send_negative(ctx, data[0], UDS_ERROR_INVALID_FORMAT);
         return;
     }
     if ((service->session_mask & uds_session_mask(ctx->session)) == 0u) {
+        uds_restore_paused_rx_s3(ctx);
         uds_send_negative(ctx, data[0],
                           UDS_ERROR_SERVICE_NOT_SUPPORTED_IN_SESSION);
         return;
@@ -514,10 +619,13 @@ void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
                  ? service->validate(&request)
                  : UDS_RESULT_OK;
     if (result != UDS_RESULT_OK) {
+        uds_restore_paused_rx_s3(ctx);
         uds_send_negative(ctx, request.sid, result);
         return;
     }
     if (service->sid != UDS_SID_DIAGNOSTIC_SESSION_CONTROL) {
+        ctx->s3_paused_for_rx = false;
+        ctx->s3_saved_remaining_ns = 0u;
         if (uds_refresh_s3(ctx) < 0) {
             uds_send_negative(ctx, request.sid, UDS_ERROR_GENERAL_REJECT);
             return;
@@ -534,29 +642,52 @@ void uds_on_isotp_message(const uint8_t *data, uint16_t len, void *user)
     response.len = 0u;
     result = service->handle(ctx, &request, &response);
     if (result != UDS_RESULT_OK) {
+        if (service->sid == UDS_SID_DIAGNOSTIC_SESSION_CONTROL) {
+            uds_restore_paused_rx_s3(ctx);
+        }
         uds_send_negative(ctx, request.sid, result);
         return;
     }
     if (service->sid == UDS_SID_DIAGNOSTIC_SESSION_CONTROL &&
         uds_apply_session_control(ctx, request.subfunction) < 0) {
+        uds_restore_paused_rx_s3(ctx);
         uds_send_negative(ctx, request.sid, UDS_ERROR_GENERAL_REJECT);
         return;
     }
     if (request.suppress_positive) {
         return;
     }
-    if (isotp_send(ctx->transport, response.data, response.len) == 0) {
-        ctx->stats.positive_responses++;
-    }
+    uds_send_payload(ctx, response.data, response.len, UDS_TX_POSITIVE, true);
 }
 
 void uds_on_isotp_tx_done(int status, void *user)
 {
     uds_ctx_t *ctx = user;
+    uds_tx_kind_t finished_kind;
+    bool resume_s3;
     uint8_t busy_sid;
 
-    (void)status;
-    if (ctx == NULL || !ctx->initialized || !ctx->busy_sid_valid) {
+    if (ctx == NULL || !ctx->initialized) {
+        return;
+    }
+
+    finished_kind = ctx->pending_tx_kind;
+    ctx->pending_tx_kind = UDS_TX_NONE;
+    if (status == 0) {
+        if (finished_kind == UDS_TX_POSITIVE) {
+            ctx->stats.positive_responses++;
+        } else if (finished_kind == UDS_TX_NEGATIVE) {
+            ctx->stats.negative_responses++;
+        }
+    }
+
+    resume_s3 = ctx->s3_paused_for_tx;
+    ctx->s3_paused_for_tx = false;
+    if (resume_s3 && ctx->session == UDS_SESSION_EXTENDED) {
+        (void)uds_start_s3_timer(ctx);
+    }
+
+    if (!ctx->busy_sid_valid) {
         return;
     }
 
@@ -600,6 +731,7 @@ int uds_on_s3_timer(uds_ctx_t *ctx)
     /* A successful timerfd read always reports at least one expiration. */
     ctx->session = UDS_SESSION_DEFAULT;
     uds_security_clear_seed(ctx);
+    uds_clear_s3_pause(ctx);
     return uds_stop_s3_timer(ctx);
 }
 

@@ -8,18 +8,18 @@
 #include <getopt.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
 #include <time.h>
 #include <unistd.h>
 
-#define MAIN_MAX_EVENTS (2 + ISOTP_TIMER_COUNT)
+#define MAIN_MAX_EVENTS (3 + ISOTP_TIMER_COUNT)
 #define MAIN_CAN_RX_BUDGET 64u
-
-static volatile sig_atomic_t stop_requested;
 
 static void main_log(const char *level, const char *format, ...)
 {
@@ -47,10 +47,9 @@ static void main_log(const char *level, const char *format, ...)
     (void)fputc('\n', stderr);
 }
 
-static void handle_signal(int signal_number)
+static bool main_is_transient_tx_error(int error)
 {
-    (void)signal_number;
-    stop_requested = 1;
+    return error == -EAGAIN || error == -EWOULDBLOCK || error == -ENOBUFS;
 }
 
 static int parse_can_id(const char *text, uint32_t *id)
@@ -58,7 +57,7 @@ static int parse_can_id(const char *text, uint32_t *id)
     char *end = NULL;
     unsigned long parsed;
 
-    if (text == NULL || id == NULL || text[0] == '\0') {
+    if (text == NULL || id == NULL || text[0] < '0' || text[0] > '9') {
         return -EINVAL;
     }
 
@@ -80,17 +79,46 @@ static void print_usage(const char *program)
                   program);
 }
 
-static int install_signal_handlers(void)
+static int open_signal_fd(void)
 {
-    struct sigaction action = {0};
+    sigset_t mask;
+    int signal_fd;
 
-    (void)sigemptyset(&action.sa_mask);
-    action.sa_handler = handle_signal;
-    if (sigaction(SIGINT, &action, NULL) < 0 ||
-        sigaction(SIGTERM, &action, NULL) < 0) {
+    (void)sigemptyset(&mask);
+    (void)sigaddset(&mask, SIGINT);
+    (void)sigaddset(&mask, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
         return -errno;
     }
-    return 0;
+    signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (signal_fd < 0) {
+        return -errno;
+    }
+    return signal_fd;
+}
+
+static int main_drain_signals(int signal_fd, bool *stop_requested)
+{
+    for (;;) {
+        struct signalfd_siginfo info;
+        ssize_t bytes_read = read(signal_fd, &info, sizeof(info));
+
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+            return -errno;
+        }
+        if ((size_t)bytes_read != sizeof(info)) {
+            return -EIO;
+        }
+        if (info.ssi_signo == SIGINT || info.ssi_signo == SIGTERM) {
+            *stop_requested = true;
+        }
+    }
 }
 
 static int main_add_epoll_fd(int epoll_fd, int fd)
@@ -123,6 +151,11 @@ static int main_drain_can(can_driver_t *driver, isotp_ctx_t *isotp)
 
         result = isotp_on_frame(isotp, &frame);
         if (result < 0) {
+            if (main_is_transient_tx_error(result)) {
+                main_log("WARN", "transient CAN TX error: %s",
+                         strerror(-result));
+                continue;
+            }
             return result;
         }
     }
@@ -135,6 +168,7 @@ int main(int argc, char **argv)
     uint32_t request_id = 0x7E0u;
     uint32_t response_id = 0x7E8u;
     bool verbose = false;
+    bool stop_requested = false;
     can_driver_t driver = {0};
     isotp_ctx_t isotp = {0};
     uds_ctx_t uds = {0};
@@ -144,6 +178,7 @@ int main(int argc, char **argv)
     const isotp_stats_t *isotp_stats;
     const uds_stats_t *uds_stats;
     int epoll_fd = -1;
+    int signal_fd = -1;
     int option;
     int result;
     int exit_status = EXIT_SUCCESS;
@@ -181,10 +216,24 @@ int main(int argc, char **argv)
         }
     }
 
-    result = install_signal_handlers();
-    if (result < 0) {
-        (void)fprintf(stderr, "error: failed to install signal handlers: %s\n",
-                      strerror(-result));
+    if (optind < argc) {
+        (void)fprintf(stderr, "error: unexpected argument: %s\n",
+                      argv[optind]);
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (request_id == response_id) {
+        (void)fprintf(stderr,
+                      "error: request and response CAN IDs must differ: "
+                      "0x%03X\n",
+                      request_id);
+        return EXIT_FAILURE;
+    }
+
+    signal_fd = open_signal_fd();
+    if (signal_fd < 0) {
+        (void)fprintf(stderr, "error: failed to create signalfd: %s\n",
+                      strerror(-signal_fd));
         return EXIT_FAILURE;
     }
 
@@ -192,7 +241,8 @@ int main(int argc, char **argv)
     if (result < 0) {
         (void)fprintf(stderr, "error: cannot open CAN interface %s: %s\n",
                       interface_name, strerror(-result));
-        return EXIT_FAILURE;
+        exit_status = EXIT_FAILURE;
+        goto cleanup;
     }
 
     (void)memset(&isotp_config, 0, sizeof(isotp_config));
@@ -201,6 +251,8 @@ int main(int argc, char **argv)
     isotp_config.tx_id = response_id;
     isotp_config.on_message = uds_on_isotp_message;
     isotp_config.on_tx_done = uds_on_isotp_tx_done;
+    isotp_config.on_first_frame = uds_on_isotp_first_frame;
+    isotp_config.on_rx_abort = uds_on_isotp_rx_abort;
     isotp_config.user = &uds;
     result = isotp_init(&isotp, &isotp_config);
     if (result < 0) {
@@ -226,6 +278,13 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    result = main_add_epoll_fd(epoll_fd, signal_fd);
+    if (result < 0) {
+        (void)fprintf(stderr, "error: cannot register signal fd: %s\n",
+                      strerror(-result));
+        exit_status = EXIT_FAILURE;
+        goto cleanup;
+    }
     result = main_add_epoll_fd(epoll_fd, can_get_fd(&driver));
     if (result < 0) {
         (void)fprintf(stderr, "error: cannot register CAN fd: %s\n",
@@ -271,7 +330,9 @@ int main(int argc, char **argv)
         for (int index = 0; index < ready; ++index) {
             int ready_fd = events[index].data.fd;
 
-            if (ready_fd == can_get_fd(&driver)) {
+            if (ready_fd == signal_fd) {
+                result = main_drain_signals(signal_fd, &stop_requested);
+            } else if (ready_fd == can_get_fd(&driver)) {
                 result = main_drain_can(&driver, &isotp);
             } else if (ready_fd == uds_s3_timer_fd(&uds)) {
                 result = uds_on_s3_timer(&uds);
@@ -281,18 +342,26 @@ int main(int argc, char **argv)
                      timer < ISOTP_TIMER_COUNT; ++timer) {
                     if (ready_fd == isotp_timer_fd(&isotp, timer)) {
                         result = isotp_on_timer(&isotp, timer);
+                        if (main_is_transient_tx_error(result)) {
+                            main_log("WARN", "transient CAN TX error: %s",
+                                     strerror(-result));
+                            result = 0;
+                        }
                         break;
                     }
                 }
             }
 
             if (result >= 0) {
+                if (stop_requested) {
+                    break;
+                }
                 continue;
             }
             main_log("ERROR", "event handling failed: %s",
                      strerror(-result));
             exit_status = EXIT_FAILURE;
-            stop_requested = 1;
+            stop_requested = true;
             break;
         }
     }
@@ -320,6 +389,9 @@ cleanup:
     can_close(&driver);
     if (epoll_fd >= 0) {
         (void)close(epoll_fd);
+    }
+    if (signal_fd >= 0) {
+        (void)close(signal_fd);
     }
     return exit_status;
 }

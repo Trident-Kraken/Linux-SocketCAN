@@ -103,6 +103,12 @@ typedef struct {
     uds_handler_t   handle;
 } uds_service_entry_t;
 
+typedef enum {
+    UDS_TX_NONE = 0,
+    UDS_TX_POSITIVE,
+    UDS_TX_NEGATIVE,
+} uds_tx_kind_t;
+
 typedef struct {
     uint64_t requests;
     uint64_t positive_responses;
@@ -118,6 +124,10 @@ struct uds_ctx {
     uint8_t              security_failed_attempts;
     bool                 security_seed_valid;
     int                  s3_timer_fd;
+    uint64_t             s3_saved_remaining_ns;
+    uds_tx_kind_t        pending_tx_kind;
+    bool                 s3_paused_for_rx;
+    bool                 s3_paused_for_tx;
     uint8_t              response_buffer[ISOTP_MAX_LEN];
     uint8_t              busy_sid;
     bool                 busy_sid_valid;
@@ -130,6 +140,8 @@ void               uds_deinit(uds_ctx_t *ctx);
 void               uds_on_isotp_message(const uint8_t *data, uint16_t len,
                                          void *user);
 void               uds_on_isotp_tx_done(int status, void *user);
+void               uds_on_isotp_first_frame(void *user);
+void               uds_on_isotp_rx_abort(void *user);
 int                uds_s3_timer_fd(const uds_ctx_t *ctx);
 int                uds_on_s3_timer(uds_ctx_t *ctx);
 const uds_stats_t *uds_get_stats(const uds_ctx_t *ctx);
