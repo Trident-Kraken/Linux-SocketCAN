@@ -11,7 +11,7 @@
 - **ISO-TP 传输层**：SF/FF/CF/FC 双向收发状态机、SN 校验(F→0 回绕)、BS/STmin 流控(含 0xF1-0xF9 微秒档)、N_Bs/N_Cr 超时管理，4095 字节协议上限双向覆盖
 - **UDS 应用层**：0x10 会话控制(含 S3 5s 超时自动降级)、0x3E TesterPresent(含肯定响应抑制)、0x22/0x2E DID 读写、0x27 Seed-Key 安全访问(3 次失败锁定 10 秒)、0x19 DTC 状态掩码查询
 - **运行时设计**：单线程 epoll 事件循环，CAN socket 与全部 timerfd 统一 fd 化派发；数据路径零 malloc/free,缓冲区静态预分配；C 侧除 libc 与内核头文件外零依赖
-- **验证体系**：pytest 68 条用例，以 python-can + can-isotp 参考实现与本协议栈交叉验证；Debug 构建 ASan/UBSan 全绿；Valgrind 10 分钟 163 万请求 0 错误 0 泄漏
+- **验证体系**：pytest 70 条用例，以 python-can + can-isotp 参考实现与本协议栈交叉验证；Debug 构建 ASan/UBSan 全绿；Valgrind 10 分钟 163 万请求 0 错误 0 泄漏
 - **文档**：需求/架构/设计三层规格文档、架构决策记录（ADR）、五类 Wireshark 抓包证据、与 ISO 标准的已知偏差清单
 
 ## 架构
@@ -84,7 +84,7 @@ $ cansend vcan0 7E0#300000AAAAAAAAAA        # 手动发 FC(CTS, BS=0, STmin=0)
   --ecu-binary=build/vuds_ecu --isotp-harness=build/isotp_rx_harness
 ```
 
-- **pytest 68 条**：正常/异常流程、ISO-TP 边界(7 字节 SF、8 字节 FF、4095 上限、SN 错乱、双超时)、0x27 全锁定生命周期、vcan down/restart 故障注入。Tester 侧以 can-isotp 作为参考实现交叉验证；无 vcan0 的环境下集成用例自动 skip,协议 harness 用例照常运行
+- **pytest 70 条**：正常/异常流程、ISO-TP 边界(7 字节 SF、8 字节 FF、4095 上限、SN 错乱、双超时)、0x27 全锁定生命周期、vcan down/restart 故障注入。Tester 侧以 can-isotp 作为参考实现交叉验证；无 vcan0 的环境下集成用例自动 skip,协议 harness 用例照常运行
 - **接口 down/restart 用例**需要 `CAP_NET_ADMIN`:
 
   ```bash

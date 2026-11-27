@@ -2,10 +2,10 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v1.11 |
-| 日期 | 2026-11-24 |
-| 状态 | 已评审（T004 RX + T005 TX + T006 会话/S3 + T007 SecurityAccess + T008 DID + T009 DTC + T010 验证基线 + 复审修复） |
-| 修订 | v1.11：0x27 已解锁返全 0 Seed、对齐 3.2/3.8 节 0x2E 校验顺序、补齐第 6 节已知偏差 |
+| 版本 | v1.12 |
+| 日期 | 2026-11-27 |
+| 状态 | 已评审（T004 RX + T005 TX + T006 会话/S3 + T007 SecurityAccess + T008 DID + T009 DTC + T010 验证基线 + 边界加固） |
+| 修订 | v1.12：补充 `can_open` `IFF_UP` 检查、`can_send` 按 `dlc` 拷贝、`isotp_init` 收发 ID 互斥、`on_first_frame`/`on_rx_abort` 暂停/恢复 S3 与完成回调统计口径 |
 | 关联文档 | [需求规格](requirements.md)、[系统架构](architecture.md)、[AGENTS.md](../../AGENTS.md) |
 | 变更规则 | 见[需求规格第 7 节](requirements.md#7-文档变更规则) |
 
@@ -61,10 +61,10 @@ const can_stats_t  *can_get_stats(const can_driver_t *driver);
 
 接口契约：
 
-- `can_open()` 校验非空参数和 11 位 ID，创建 nonblocking CAN RAW socket、安装精确过滤器并绑定接口。成功返回 0；失败返回负 errno，且 driver 保持可安全 `can_close()` 的关闭状态。
+- `can_open()` 校验非空参数和 11 位 ID，创建 nonblocking + `SOCK_CLOEXEC` CAN RAW socket、确认接口已处于 `IFF_UP`（未启动返回 `-ENETDOWN`）、安装标准数据帧精确过滤器（含 `CAN_EFF_FLAG | CAN_RTR_FLAG`）并绑定接口。成功返回 0；失败返回负 errno，且 driver 保持可安全 `can_close()` 的关闭状态。
 - `can_get_fd()` 返回借用 fd，仅供 main 注册 epoll；调用方不得关闭。未打开时返回 -1。
 - `can_recv()` 成功取得一个 11 位数据帧时返回 0；队列已排空返回 `-EAGAIN`；其他失败返回负 errno。EFF/RTR/error frame 在驱动内丢弃，DLC=0 的标准数据帧仍上交 ISO-TP 做异常输入验证。
-- `can_send()` 只接受 11 位数据帧且 `dlc <= 8`，参数错误返回 `-EINVAL`。ISO-TP 发送的帧必须令 DLC=8，并自行填充 0xAA。
+- `can_send()` 只接受 11 位数据帧且 `dlc <= 8`，按 `dlc` 字节拷贝数据（其余字节清零），参数错误返回 `-EINVAL`。ISO-TP 发送的帧必须令 DLC=8，并自行填充 0xAA。
 - `can_driver_frame_sender()` 返回借用 driver 的 SocketCAN adapter。CAN 帧发送器的 context 和 `send()` operation 都由 ISO-TP 借用；内存 adapter 可在 harness 中替代 SocketCAN。
 - RX/TX 十六进制日志和 `frames_rx/frames_tx` 只在成功收发后由 can_driver 更新。统计指针为只读借用，在 driver 对象生命周期内有效。
 - `can_close()` 幂等，只关闭自己拥有的 CAN fd 并复位运行状态，不清空最终统计，也不关闭 epoll 或协议层 timerfd；下一次成功 `can_open()` 才重新清零统计。
@@ -223,14 +223,17 @@ RX 与 TX 状态正交。即使 TX 正在 WAIT_FC/WAIT_STMIN，新请求仍可�
 
 typedef void (*isotp_rx_cb_t)(const uint8_t *data, uint16_t len, void *user);
 typedef void (*isotp_tx_done_cb_t)(int status, void *user);
+typedef void (*isotp_rx_event_cb_t)(void *user);
 
 typedef struct {
-    can_frame_sender_t frame_sender;
-    uint32_t           rx_id;
-    uint32_t           tx_id;
-    isotp_rx_cb_t      on_message;
-    isotp_tx_done_cb_t on_tx_done;
-    void              *user;
+    can_frame_sender_t  frame_sender;
+    uint32_t            rx_id;
+    uint32_t            tx_id;
+    isotp_rx_cb_t       on_message;
+    isotp_tx_done_cb_t  on_tx_done;
+    isotp_rx_event_cb_t on_first_frame;
+    isotp_rx_event_cb_t on_rx_abort;
+    void               *user;
 } isotp_config_t;
 
 typedef enum {
@@ -260,7 +263,7 @@ const isotp_stats_t *isotp_get_stats(const isotp_ctx_t *ctx);
 
 生命周期与返回值契约：
 
-- `isotp_init()` 借用 `config->frame_sender`，要求其 context 和 `send()` operation 非空，并校验回调和 11 位 ID，创建三个初始未激活的 timerfd。成功返回 0；失败返回负 errno，并回滚本次已创建的全部 timerfd。
+- `isotp_init()` 借用 `config->frame_sender`，要求其 context 和 `send()` operation 非空，并校验回调、11 位 ID 与 `rx_id != tx_id`（`on_first_frame`/`on_rx_abort` 为可选回调），创建三个初始未激活的 timerfd。成功返回 0；失败返回负 errno，并回滚本次已创建的全部 timerfd。
 - `isotp_timer_fd()` 返回由 ISO-TP 拥有的借用 fd，main 只注册、不读取、不关闭。`isotp_on_timer()` 负责读取并清空 expiration counter，再处理对应事件。
 - `isotp_deinit()` 幂等，停止并关闭三个 timerfd、清空状态和缓冲区；不关闭 can_driver，不调用任何回调。
 - `isotp_on_frame()` 对已处理或按协议忽略的帧返回 0；CAN 帧发送器等本地操作失败时返回负 errno，并先把受影响状态机恢复到可接收下一次传输的状态。
@@ -271,6 +274,7 @@ const isotp_stats_t *isotp_get_stats(const isotp_ctx_t *ctx);
 - SF 可以在 `isotp_send()` 内同步完成，因此 `on_tx_done()` 允许在该函数返回前发生。回调执行前 TX 必须已经 IDLE，回调可以再次调用 `isotp_send()`。
 - `on_tx_done()` 的 status 为 0 表示发送完成；CAN I/O 或 TX timer 清理错误使用对应负 errno，N_Bs 超时使用 `-ETIMEDOUT`，FC Overflow 使用 `-EMSGSIZE`。
 - `on_message()` 可以由 `isotp_on_frame()` 同步触发。data 指向内部 RX 缓冲，只在回调期间有效；回调不得保存或修改该指针。触发回调前 RX 必须已经停止 N_Cr 并恢复 IDLE。
+- `on_first_frame()` 在有效 FF 已回复 FC 并启动 `N_Cr` 后触发；`on_rx_abort()` 在等待 CF 期间发生 SN 错误、`N_Cr` 超时或新 FF 失败中断时触发，供上层恢复暂停的会话定时器。
 - `isotp_tx_busy()` 仅反映业务 TX 状态。内部发送 FC 不令其变为 true；已完成同步 SF 后它返回 false。
 
 数据路径禁止 malloc/free。
@@ -371,6 +375,8 @@ void               uds_deinit(uds_ctx_t *ctx);
 void               uds_on_isotp_message(const uint8_t *data, uint16_t len,
                                          void *user);
 void               uds_on_isotp_tx_done(int status, void *user);
+void               uds_on_isotp_first_frame(void *user);
+void               uds_on_isotp_rx_abort(void *user);
 int                uds_s3_timer_fd(const uds_ctx_t *ctx);
 int                uds_on_s3_timer(uds_ctx_t *ctx);
 const uds_stats_t *uds_get_stats(const uds_ctx_t *ctx);
@@ -381,13 +387,13 @@ const uds_stats_t *uds_get_stats(const uds_ctx_t *ctx);
 - `uds_init()` 创建并保持 S3 timerfd 为未激活状态，默认会话为 DEFAULT，安全状态为 LOCKED。失败返回负 errno并回滚自己的资源。
 - `uds_s3_timer_fd()` 返回借用 fd；main 只注册。`uds_on_s3_timer()` 读取 expiration counter，执行回默认会话、清 seed 和重新上锁。
 - `uds_deinit()` 幂等，停止并关闭 S3 timerfd、清空响应和 busy 槽，不发送响应、不触发 ISO-TP 回调。
-- `uds_on_isotp_message()` 与 `uds_on_isotp_tx_done()` 直接作为 ISO-TP 回调。main 必须在进入 epoll 前完成两个 context 的初始化，退出时先 deinit UDS。
+- `uds_on_isotp_message()`、`uds_on_isotp_tx_done()`、`uds_on_isotp_first_frame()` 与 `uds_on_isotp_rx_abort()` 直接作为 ISO-TP 回调。main 必须在进入 epoll 前完成两个 context 的初始化，退出时先 deinit UDS。
 - handler 写入完整肯定响应 payload；失败时 response 内容被忽略。handler 可以执行协议明确要求的失败副作用，例如错误 Key 增加计数，但 validator 始终无副作用。
-- engine 在 handler 返回后统一处理 suppress、NRC 和 `isotp_send()`。一旦非 busy 请求进入 handler，其协议副作用不因后续 CAN/ISO-TP 发送失败而回滚。
+- engine 在 handler 返回后统一处理 suppress、NRC 和 `isotp_send()`。一旦非 busy 请求进入 handler，其协议副作用不因后续 CAN/ISO-TP 发送失败而回滚。`positive_responses` 与 `negative_responses` 统计只在 `uds_on_isotp_tx_done(status == 0)` 确认传输成功后递增。
 
 `uds_engine.c` 独占服务表、会话/安全状态、S3 和 busy 槽；`uds_services.c` 只实现 validator/handler。0x10 handler 只构造肯定响应，成功后的会话切换和安全复位由 engine 应用；响应发送失败不回滚这些协议副作用。`uds_data.c` 独占 DID/DTC 静态表并提供查找/读写辅助函数以及纯 `uds_compute_key()`。数据辅助函数不发送响应、不修改会话或安全状态，返回内部结果而不是 NRC 字节。
 
-S3 生命周期固定如下：默认会话不启动定时器；成功的 `10 03` 或任何扩展会话中的有效诊断请求启动/重置 5000ms timerfd；成功的 `10 01` 和 S3 到期都停用定时器并回默认会话、重新上锁。有效请求定义为通过 validator 的请求，因此安全拒绝、业务 NRC 和 `3E 80` 会续期，而未知 SID、长度/子功能错误和 TX busy 请求不会续期。0x2E 端到端的 S3 降级断言属于 T008，T006 不引入临时 0x2E 服务。
+S3 生命周期固定如下：默认会话不启动定时器；成功的 `10 03` 或任何扩展会话中的有效诊断请求启动/重置 5000ms timerfd；成功的 `10 01` 和 S3 到期都停用定时器并回默认会话、重新上锁。有效请求定义为通过 validator 的请求，因此安全拒绝、业务 NRC 和 `3E 80` 会续期，而未知 SID、长度/子功能错误和 TX busy 请求不会续期。扩展会话下收到合法 FF 时通过 `uds_on_isotp_first_frame()` 保存 S3 剩余时间并暂停定时器：若多帧传输中断（`uds_on_isotp_rx_abort()`）或完整报文未通过前置/validator 校验，恢复此前保存的 S3 剩余时间而不免费续期；发送长度超过 7 字节的多帧肯定响应时同样暂停 S3，待 `uds_on_isotp_tx_done()` 完成后重新启动 5000ms S3。
 
 ```text
 DEFAULT -- valid 10 03 --> EXTENDED + arm/rearm S3(5000 ms)

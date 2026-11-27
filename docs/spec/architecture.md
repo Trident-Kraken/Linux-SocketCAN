@@ -97,21 +97,22 @@ ISO-TP RX 与 TX 是两个独立状态机，可以在同一个事件循环中同
 
 | fd | 事件 | 处理 |
 |---|---|---|
-| `can_get_fd()` | CAN 帧到达 | `can_recv` → `isotp_on_frame` |
+| `signalfd` | `SIGINT` / `SIGTERM` 到达 | 读取信号并置退出标志 |
+| `can_get_fd()` | CAN 帧到达 | `can_recv` → `isotp_on_frame`（瞬态发送拥塞 `-EAGAIN`/`-EWOULDBLOCK`/`-ENOBUFS` 打 WARN 不崩溃） |
 | `isotp_timer_fd(N_BS)` | TX 等待 FC 超时 | `isotp_on_timer(N_BS)` |
 | `isotp_timer_fd(STMIN)` | TX 可发送下一帧 CF | `isotp_on_timer(STMIN)` |
 | `isotp_timer_fd(N_CR)` | RX 等待 CF 超时 | `isotp_on_timer(N_CR)` |
 | `uds_s3_timer_fd()` | S3 会话超时 | `uds_on_s3_timer()` |
 
-0x27 的 10 秒锁定期不占用定时器：用 `CLOCK_MONOTONIC` 记录 `lock_until`，`requestSeed` 到达时惰性判断；过期则清零失败计数。除惰性判断外，所有需要主动触发的等待都用 timerfd 表达。
+0x27 的 10 秒锁定期不占用定时器：用 `CLOCK_MONOTONIC` 记录 `lock_until`，`requestSeed` 到达时惰性判断；过期则清零失败计数。除惰性判断外，所有需要主动触发的等待与信号均以 fd 接入 epoll。
 
 ## 4. 主程序运行约定
 
 | 项 | 规格 |
 |---|---|
-| 启动参数 | `./vuds_ecu [-i vcan0] [-r 0x7E0] [-t 0x7E8] [-v]`（`-v` 开启 DEBUG 日志） |
+| 启动参数 | `./vuds_ecu [-i vcan0] [-r 0x7E0] [-t 0x7E8] [-v]`（`-v` 开启 DEBUG 日志，拒绝多余位置参数与相同收发 ID） |
 | 事件循环 | `epoll_wait` 主循环，按 fd 派发 |
-| 信号 | SIGINT/SIGTERM → 置退出标志，循环退出后关闭 fd、打印统计 |
+| 信号 | `sigprocmask(SIG_BLOCK)` + `signalfd` 接入 epoll → 置退出标志，循环退出后关闭 fd、打印统计 |
 | 日志 | `[HH:MM:SS.mmm] [LEVEL] [module] msg`，模块名 can/isotp/uds/main；级别 DEBUG/INFO/WARN/ERROR |
 | 帧日志 | can_driver 在 DEBUG 级输出方向、ID 和数据 hex，是 W1 调试主工具 |
 | 统计 | `can_frames_rx` / `can_frames_tx` / `uds_requests` / `uds_positive` / `uds_negative` / `isotp_timeouts` / `isotp_sn_errors` |

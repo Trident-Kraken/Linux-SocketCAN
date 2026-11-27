@@ -81,7 +81,7 @@ CI（GitHub Actions `ubuntu-latest`）：
 - 若 runner 内核缺少内置 `vcan` 模块，CI 脚本通过 `linux-modules-extra-$(uname -r)` 加载，不可用时显式警告降级。
 - Release 作业：`62 passed, 1 skipped`，FT-01 以 sudo 单跑 `1 passed`；Debug（ASan/UBSan）作业：`62 passed, 1 skipped`。
 
-## 复审修复更新（2026-11-24）
+## 复审修复更新（2026-11-27）
 
-- 补充 SocketCAN 内核 `EFF/RTR` 过滤掩码与 `SOCK_CLOEXEC`、`0x27` 已解锁状态全 0 Seed 响应、CMake 默认 `Release` 构建类型与不可恢复 UBSan（`-fno-sanitize-recover=all`）。
-- 补全端到端集成用例后，测试集共收集 68 条用例：`vcan0` 特权环境 Release 回归 `68 passed`（含 FT-01）；Debug（ASan/UBSan + `-fno-sanitize-recover=all`）非特权 `vcan0` 回归 `67 passed, 1 skipped in 40.00s`（仅 FT-01 因无 `CAP_NET_ADMIN` 跳过），零 Sanitizer 报错。
+- 补充 SocketCAN 内核 `EFF/RTR` 过滤掩码、`SOCK_CLOEXEC` 与 `IFF_UP` 检查、`can_send` 按 `dlc` 拷贝、`0x27` 已解锁全 0 Seed、`isotp_init` 禁止 `rx_id == tx_id`、多帧收发期间 S3 暂停/恢复、`on_tx_done` 完成口径统计、`signalfd` 信号接入 epoll、严格 CLI 校验与瞬态拥塞日志降级。
+- 补全端到端与边界用例后，测试集共收集 70 条用例（含 `uds-multiframe-s3` C harness 与 `test_cli_rejects_invalid_arguments`）。
